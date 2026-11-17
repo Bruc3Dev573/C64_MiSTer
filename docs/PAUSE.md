@@ -1,28 +1,37 @@
-# Machine stop and OSD pause
+# User pause
 
-The stop of the machine that the savestates use, and the upstream OSD
-option **Pause When OSD is Open** on top of it (work package A0 of the
-savestate plan). This branch has no pause button: the pad **Pause** button,
-the keyboard **Pause/Break** key and the Pause Dim Video and Pause Mute
-Audio options of A0 are not part of it.
+Branch `pause`, work package A0 of the savestate plan.
 
 ## Using it
 
 | Control | Effect |
 | --- | --- |
-| OSD > Hardware > **Pause When OSD is Open** | As upstream: the machine stops while the OSD is open and HDMI holds the last whole frame; the analog output keeps its sync and shows the last frame |
+| Keyboard **Pause/Break** | Toggles the pause |
+| Pad button **Pause** (default **Start**, remappable in Define joystick buttons) | Toggles the pause |
+| OSD > Hardware > **Pause When OSD is Open** | Unchanged: the machine also stops while the OSD is open |
+| OSD > Hardware > **Pause Dim Video** (O[89]) | On pause, one more frame is shown at half brightness and HDMI freezes on it |
+| OSD > Hardware > **Pause Mute Audio** (O[90]) | Audio fades out in ~33 ms after the pause and back in on resume. It follows the user and OSD pause only: the stops of a savestate (2-3 frames) hold the sound instead |
+
+The pause is released automatically by any reset (OSD, USER button, Reset &
+Detach), by the start of a download or upload (PRG, CRT, TAP, ROM, cartridge
+save) and by a PAL/NTSC switch, because all of these need the machine running.
+
+The pause key never reaches the C64 keyboard matrix (Pause has no C64 key), so
+it does not disturb running programs.
 
 ## How it works
 
-`freeze` (clk_sys) follows `OSD open & Pause When OSD is Open`, as upstream,
-and changes only on `freeze_sync`, i.e. on a frame boundary of the scaler,
-so HDMI holds a whole frame. `fpga64_sid_iec` stops the machine on the
-refresh cycle (`sysEnable` low, `sysCycle` held at `CYCLE_EXT4`); its
-`pause_out` (`c64_pause`) holds the 1541/1581 drives, `video_sync` and the
-blocks of "Leaks closed". The savestate engine stops the machine through the
-same pause input (`ss_freeze`, `docs/SAVESTATES.md` "Freeze").
+The existing freeze path is reused. `freeze` (clk_sys) now follows
+`(OSD open & Pause When OSD is Open) | user_pause` and changes only on
+`freeze_sync`, i.e. on a frame boundary of the scaler, so HDMI holds a whole
+frame. `fpga64_sid_iec` stops the machine on the refresh cycle (`sysEnable`
+low, `sysCycle` held at `CYCLE_EXT4`); `pause_out` (`c64_pause`) is already
+used by the 1541/1581 drives and by `video_sync`.
 
-### Picture and sync while stopped (analog output)
+With Dim enabled the sequence is: pause requested -> next frame is drawn
+dimmed -> freeze. The C64 runs one more frame before stopping.
+
+### Picture and sync while paused (analog output)
 
 HDMI keeps a frame in the scaler, but the analog output comes straight from
 the core, and the VIC stops with the machine. So while stopped:
@@ -31,9 +40,9 @@ the core, and the VIC stops with the machine. So while stopped:
   geometry: PAL 6569 is 504x312 dots, NTSC 6567R8 is 520x263;
 - `pause_fb` (rtl/pause_fb.sv) records the VIC color index of every visible
   dot while the machine runs (4 bits x 382x270 PAL / 404x250 NTSC, ~51 M10K)
-  and plays it back on the same dots while stopped, through the same
-  palette. The dots after the stop point hold the previous frame, the ones
-  before it the current one: what the screen showed.
+  and plays it back on the same dots while stopped, through the same palette
+  and the same Dim option. The dots after the stop point hold the previous
+  frame, the ones before it the current one: what the screen showed.
 - The machine resumes only when the free-running position is back on the
   position of the stopped VIC (`resume_ok`, at most one frame after the
   release), so the VIC continues exactly where the output is: no sync jump
@@ -41,7 +50,7 @@ the core, and the VIC stops with the machine. So while stopped:
   clocks (~133 ms PAL); that fallback can jump the sync and is not normal
   alignment.
 
-While `HDMI_FREEZE` is high (OSD pause, savestate operation) the
+While `HDMI_FREEZE` is high (user/OSD pause, savestate operation) the
 freezer of `sys/video_mixer.sv` blanks the picture and regenerates the sync
 it measured before; `pause_fb` shows on the output, and goes into the scaler,
 in the stopped clocks without it, e.g. the realignment wait after a release.
@@ -76,7 +85,7 @@ output gained 40-100 dots per operation: the stop was not whole frames and
 the first line after the resume was 2-26 clk_sys off.
 
 A save or load requested while the machine is stopped away from a savestate
-boundary (OSD pause, or the realignment wait after a release) lets the
+boundary (user/OSD pause, or the realignment wait after a release) lets the
 machine run to the next boundary for a few cycles (`ss_freeze`). That run
 starts only on the sample after `resume_ok` (`run_ok` of `ss_freeze`,
 `ss_run_ok` in c64.sv), when the free-running output is on the stopped VIC,
@@ -127,7 +136,7 @@ The pause lengths are whole multiples of the 32-clock C64 cycle (sysEnable is
 re-evaluated once per cycle at `pred(CYCLE_EXT4)`), so every gated block sees
 exactly the clocks it would have seen without the pause: a run with a pause of
 N cycles must be the uninterrupted run shifted by N. This is the simulation
-acceptance of A0 (`sim/tests/pause.sh`, with the OSD pause in this branch).
+acceptance of A0 (sim flow on branch `sim-b1`).
 
 ## Known limits
 
@@ -135,3 +144,4 @@ acceptance of A0 (`sim/tests/pause.sh`, with the OSD pause in this branch).
   saved in the savestate is part of A7.
 - RS-232 (UP9600 / VIC-1011) and external IEC devices are real-time links: data
   that arrives while paused is lost, as on real hardware with the CPU stopped.
+- Keys and joystick moves made while paused are seen by the C64 on resume.

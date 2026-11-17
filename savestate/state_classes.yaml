@@ -390,12 +390,36 @@
 - match: "emu.ovl_color"
   class: ignored
   reason: overlay colour register (video output)
+- match: "emu.user_pause"
+  class: ignored
+  reason: user pause toggle (framework, A0); the savestate engine drives pause itself
+- match: "emu.old_pad"
+  class: ignored
+  reason: edge detector of the pause pad button (framework)
+- match: "emu.old_stb"
+  class: ignored
+  reason: edge detector of the PS/2 strobe for the Pause key (framework)
+- match: "emu.old_dl"
+  class: ignored
+  reason: edge detector of ioctl_download releasing the pause (framework)
+- match: "emu.old_ul"
+  class: ignored
+  reason: edge detector of ioctl_upload releasing the pause (framework)
 - match: "emu.freeze"
   class: ignored
-  reason: OSD pause / HDMI freeze request (framework)
+  reason: pause/HDMI freeze request (framework)
+- match: "emu.pause_dim"
+  class: ignored
+  reason: pause dim state (framework, video output)
 - match: "emu.old_sync"
   class: ignored
   reason: edge detector of freeze_sync from the scaler (framework)
+- match: "emu.pause_att"
+  class: ignored
+  reason: pause audio fade (framework, audio output)
+- match: "emu.div#2"
+  class: ignored
+  reason: time base of the pause audio fade (framework)
 - match: "emu.dbg_*"
   class: ignored
   reason: DDR3 snoop for the drive debug overlay (debug)

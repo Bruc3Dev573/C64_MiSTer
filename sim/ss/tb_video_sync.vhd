@@ -23,7 +23,7 @@ use std.env.all;
 -- counter frame wrap (the vsync line), the stop positions where the dot
 -- counter and the raster line step apart (X 398 PAL, 398-414 NTSC), the
 -- delayed last line, the last stop of the frame and the same position, and
--- one is followed by a pause. After running PAL/NTSC switches X and the
+-- one is followed by a user pause. After running PAL/NTSC switches X and the
 -- line are outside the new frame; the next pause still resumes within a
 -- frame.
 entity tb_video_sync is
@@ -172,7 +172,7 @@ begin
 
 		-- a load while stopped: the chain moves X, the line and the VIC hsync
 		-- through other values, then the VIC is at the saved stop position
-		-- (X lx = 8n+6 on raster line ly); hold: the pause after it
+		-- (X lx = 8n+6 on raster line ly); hold: the user pause after it
 		procedure load(lx, ly : natural; what : string; hold : natural := 3) is
 		begin
 			stop;
@@ -205,7 +205,7 @@ begin
 			load(6, 0, "a load at the first stop of the VIC frame");
 			stop;
 			load(x, y, "a load of the stop position");
-			load(430, 150, "a load followed by a pause", dots * lines * 6);
+			load(430, 150, "a load followed by a user pause", dots * lines * 6);
 			run_to_line(lines - 2);
 			load(102, 2, "a load across the VIC frame wrap, forward");
 			run_to_line(2);

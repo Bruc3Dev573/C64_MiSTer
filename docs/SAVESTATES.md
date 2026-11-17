@@ -29,7 +29,7 @@ Map: `savestate/map.yaml` (generated constants in `rtl/savestate/`).
 | Pad **Savestates** (new button, default Select) + Left/Right | Previous / next slot |
 | (after any load) | All keys are released (D3) |
 | Pad **Savestates** + Down / Up | Save / load the selected slot. While the button is held (and 10 ms after) the C64 does not see the pads |
-| OSD **Pause When OSD is Open** | As upstream; the savestates also work from this pause (`PAUSE.md`) |
+| Keyboard **Pause/Break** | User pause, unchanged (`PAUSE.md`) |
 
 Messages (OSD info): slot selected, saved, restored, or the reason of a
 refusal: no safe point (save abandoned), REU too large for the slot, slot
@@ -53,13 +53,13 @@ empty or invalid, other core version, other hardware settings, slot damaged
 Two levels on the same machine stop (`sysEnable` in `fpga64_sid_iec`,
 `docs/PAUSE.md`):
 
-1. **pause**: the OSD pause (Pause When OSD is Open), as upstream, frame aligned for HDMI.
+1. **pause**: user pause / OSD pause, as before, frame aligned for HDMI.
 2. **freeze_req / freeze_ack**: while the engine asks for it, the pause
    input of fpga64 is the AND of the idle signals. fpga64 samples it once per
    C64 cycle group on the clock where it raises `refresh`, so the machine
    stops exactly on a sample where everything was idle; `ss_freeze` then holds
    it until the engine is done and acknowledges. A machine that was already
-   paused mid-instruction runs again until the next boundary (a few C64
+   user-paused mid-instruction runs again until the next boundary (a few C64
    cycles; HDMI stays frozen during a savestate), starting on the sample
    after `video_sync`'s `resume_ok` (input `run_ok`), so the video output
    keeps its sync (`PAUSE.md`).
@@ -235,7 +235,7 @@ write command).
   clocks, so a request raised on the last running clock after the boundary
   sample (the drive stops one clock after `c64_pause`) waits in the chain
   instead of starting a transfer while the engine owns the buffer port, and
-  a pause shows the host no request; a transfer the host had already
+  a user pause shows the host no request; a transfer the host had already
   taken lands in the buffer during the pause and its end is seen, or the
   request repeated once, when the drive runs again. The boundary (idle bit 3)
   waits until no request is pending towards the host and none starts on the
@@ -407,13 +407,13 @@ Rules every segment follows (they come from the engine, not from the chip):
   moves between its dma_cycle/ram_cycle waits on any clock; the cartridge
   logic and the EasyFlash flash chips react to bus strobes and count (Epyx
   capacitor, flash program/erase time) on every clock. Holding them only on
-  `ss_hold` lets them move while the machine is stopped (OSD pause, the
+  `ss_hold` lets them move while the machine is stopped (user pause, the
   clocks before and after the engine), so a resume or a load lands a few
   clocks off (REU: one step of the DMA state machine ahead; SID: the output
   samples change before the resume). They hold on the condition that stops
   the machine (`not sysEnable`: `sid_hold` in fpga64, `c64_pause` in c64.sv,
   port `stop`/`pause`) and resume exactly where they were cut. This also
-  holds them while the chain shifts. Found by `sim/tests/pause.sh` (a
+  holds them while the chain shifts. Found by `sim/tests/pause.sh` (user
   pause, no savestate) with reu.prg: a pre-existing pause divergence.
   When the logic follows a pipelined clock enable, the hold follows the grid
   of the logic that consumes it. fpga64 freezes on sysCycle EXT4 and runs
@@ -558,13 +558,13 @@ the engine releases it, so the analog output and the scaler see no sync
 jump and `video_calc` no change of resolution. The output dot divider
 ignores the VIC hsync while the machine is stopped: the chain moves it
 through the bits of its neighbours during every save and load. A request
-that comes while the machine is stopped away from a boundary (OSD pause)
+that comes while the machine is stopped away from a boundary (user pause)
 lets it run to the boundary only on the sample after `resume_ok`
 (`ss_freeze` input `run_ok`), so that run does not move the output either.
 Until 15 November all three failed: a load resumed on the pre-load stop
 point (one irregular line and frame; Main showed the video info after loads
 with `video_info`, the scaler resynchronized), every save and load moved
-the output by 40-100 dots, and a save or load from a pause jumped the
+the output by 40-100 dots, and a save or load from a user pause jumped the
 output by the paused time.
 
 ## Tests
@@ -576,13 +576,13 @@ output by the paused time.
 | `SDRAM=real DRIVES=0 sim/build.sh` | Build real `rtl/sdram.v` driving a command-level MT48LC16M16A2, then run each of `savestate.sh`, `pause.sh` and `ssdiff.sh` with `SDRAM=real`. Checks byte lanes, bank/row state, CAS=2, auto-precharge, initialization, tRCD/tRP/tRAS/tRC/tRFC/tWR/tMRD and rolling 8192-refresh/64 ms retention. Each instance reports violations and longest refresh gap separately while `ss_sd_own` is asserted and during normal running; a violation fails the run. Use the same option for the long `LORENZ`/`VICII` run. Timing sources and model limits: `sim/README.md`, “Real SDRAM controller and chip checking”. |
 | `sim/tests/sdram.sh` | Chip self-check: all banks, both byte lanes, DQM on writes and reads, CAS=2, auto-precharge, intentional tRCD and refresh-deadline violations with engine ownership. Then a throwaway `RTL_OVERLAY` build with `RASCAS_DELAY=1`: requires actual tRCD violations, not just a failed boot. On 2026-11-06: chip checks PASS; overlay rejected with 143,603 normal-running tRCD violations, zero engine-owned violations. |
 | `sim/tests/ssdiff.sh` | Field offsets from slots saved at a known point (`ss_slot.py --fields`): CPU PC/A/X/Y, CIA1 and VIC after the KERNAL init (regs.prg), SID1/SID2 register files (sid.prg), REU registers after a swap (reu.prg), CART bank registers (ocean.crt). B3 differential `ssdiff` at READY, in sid.prg (noise/pulse/triangle, gate toggles, filter sweep, OSC3/ENV3 read back), reu.prg (REU 512 KiB: swap and $FF00-triggered fetch in a loop, REU RAM in the slot), ocean.crt (Ocean bank switching from the cartridge ROM) and, with `LORENZ=<dir of Disk1-3.d64>` / `VICII=<dir of VICE VICII testprogs>`, inside 29 Lorenz 2.15 tests (CPU, CIA timers/TOD/ICR/serial) and 9 VIC-II tests: B saves slot 2, runs on, saves slot 1, loads slot 2, loads slot 1, saves slot 3 (= slot 1 byte for byte), resumes, and must stay sample-identical (bus, RAM strobes, RGB, audio mix) to the uninterrupted A; the 'rebuilt' grid registers and the T65 reset synchroniser are checked on every clock the engine owns B. `JOBS=n` runs tests in parallel. Test programs: `sim/scripts/testprgs.sh`; `--prg x.crt` loads a CRT through the OSD index |
-| `sim/tests/pause.sh` | A0 pause (no savestate), the OSD pause: B paused, A not, sample-identical after the resume and regular video sync; READY, NTSC, tape LOAD on a pilot tone and on varied pulses with a 10-frame pause (`tapevar`), sid.prg, reu.prg, ocean.crt, ef.crt (the pause inside a sector erase, A11), geo.prg (A11), rtc.prg, opl.prg (`--opl`: the OPL output is in the compared audio, A9) |
+| `sim/tests/pause.sh` | A0 user pause (no savestate): B paused, A not, sample-identical after the resume and regular video sync; READY (key, pad), tape LOAD on a pilot tone and on varied pulses with a 10-frame pause (`tapevar`), sid.prg, reu.prg, ocean.crt, ef.crt (the pause inside a sector erase, A11), geo.prg (A11), rtc.prg, opl.prg (`--opl`: the OPL output is in the compared audio, A9) |
 | `sim/tests/ssdiff.sh` opl.prg, oplrewind (A9) | `--opl`, Sound Expander on (status 12, DolphinDOS): the OPL3 fields at the first wait of opl.prg (index $A0 before its value, timer presets and enables) and the OPL3_REGS region; ssdiff inside the music (timers polled by the CPU, index written before each wait), audio compared up to the first load, the rest of the sample exact. After the resume, with a model of the queue the Z80 reads: B's queue consumed within one frame (21,234 clk_sys), at that point the registers and the index latch the firmware took equal B's shadow and index register, and at the end the register files of A and B are equal. `oplrewind` (`--rewind`, audio left out): the FM part holds the registers of C1 when the state of C0 is loaded, so the replay has to queue the changed ones. Negative controls (overlay of `opl3.sv`): without the final index the latch check fails; without the replay `oplrewind` fails |
 | `sim/tests/ssdiff.sh` tape scenarios | `pilot` (pilot tone), `vartap` (20000 pulses of varied length: a byte lost, repeated or corrupted anywhere in the tape path changes the cassette line, a pilot tone hides it) and `rewind` (`--rewind`: B saves slot 2 at C0, runs on, loads it and must replay A's samples from C0, i.e. a load of a state from another moment) |
 | `sim/tests/ssdiff.sh` ef.crt, geo.prg (A11) | `ef`: EasyFlash CRT (`testprgs.sh`) that boots in Ultimax and loops from RAM: sector erase of ROML banks 0-7 with DQ6 polling (the poll count goes to the screen), 64 bytes programmed in bank 1 from the pass number and the EasyFlash RAM, read back and summed into the EasyFlash RAM; both save points and loads fall inside a sector erase (`CART.ez_rom_rom0_state` busy and `ez_rom_rom0_mem_req` set in both slots), so the busy counter, the partly done write-back and the partly erased flash come back. `geo`: GeoRAM 4 MiB on (status 52 at READY), pages written through $DFFE/$DFFF and $DE00 and read back one and eight passes later on both sides of the save points; the GEORAM region in both slots. The harness lets A run at most 1M samples ahead of B's comparisons, so the seconds a GeoRAM save takes queue no samples |
 | `run_core.sh pausetest --load-slot board.ss` | A/B pause test from a slot saved on the board (sim built with `BUILD_DATE=yymmdd` of the board build, same chain) |
 | `DRIVE=1 sim/tests/ssdiff.sh` | adds the drive differentials on the full model, run at once: 1541, DolphinDOS parallel-cable `LOAD"*",8` of a 7-block file from a D64 made by `mkd64.py`, both save points (C0, C1) and the load while the head reads track 17 (`DRV8_1541.track` checked in both slots), drive RAM, RAM expansion and track buffer in the slot; 1581 (A10), DolphinDOS `LOAD"*",8` of a 3-block file from a D81 made by `mkd81.py`, both save points while the WD1772 reads the 10 sectors of the directory track (`DRV8_1581.fdc_track` 0x27 and `fdc_motor_on` checked in both slots), drive RAM and sector buffer in the slot; `drive1581rw` (`--rewind`): the load of a state saved while the WD1772 hands the bytes of a sector to the CPU (checked in its slot: transfer running) |
-| `DRIVE=1 sim/tests/pause.sh` | adds the OSD pause during the same DolphinDOS disk LOADs (1541 and 1581, full model) |
+| `DRIVE=1 sim/tests/pause.sh` | adds the user pause during the same DolphinDOS disk LOADs (1541 and 1581, full model) |
 | `sim/run_core.sh boot --prg f.prg --freeze-at <cycles or $ADDR> --slot out.ss` | write a slot image; `--load-slot in.ss` restores one |
 | `sim/scripts/ss_slot.py slot.ss` | header, TLV list, CRC check with zlib, `--region TAG file` extracts a region, `--fields SEG` decodes a chain segment |
 

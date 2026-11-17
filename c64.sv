@@ -62,7 +62,8 @@ assign HDMI_BOB_DEINT = 0;
 //
 // 6     7         8         9         10        11        12
 // 45678901234567890123456789012345 67890123456789012345678901234567
-// XXXXXXXXXXXXXXXXXXXXXXXXX  XXXXX
+// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+//                          ^^ 89=Pause Dim Video, 90=Pause Mute Audio
 //                            ^^^^^ 91=Counter Reset, 92=Counter,
 //                                  93=Rewind, 94=Fast Forward, 95=Stop
 //                                     ^^^^^^ 99=Savestates to SD, 101:100=Slot,
@@ -135,6 +136,8 @@ localparam CONF_STR = {
 	"P2O[24],Clear RAM on Reset,Yes,No;",
 	"P2O[50],Reset & Run PRG,Yes,No;",
 	"P2O[42],Pause When OSD is Open,No,Yes;",
+	"P2O[89],Pause Dim Video,No,Yes;",
+	"P2O[90],Pause Mute Audio,No,Yes;",
 	"P2O[39],Tape Auto Play,Yes,No;",
 	"P2O[96],Tape Auto Unload,Yes,No;",
 	"P2O[38],Boot EasyFlash,Yes,No;",
@@ -197,9 +200,9 @@ localparam CONF_STR = {
 	"Savestate: DDR3/RAM timeout,",
 	"Savestate self-test: PASS,",
 	"Savestate self-test: FAIL;",
-	"J,Fire 1,Fire 2,Fire 3,Paddle Btn,Mod1,Mod2,Savestates;",
-	"jn,A,B,Y,X|P,R,L,Select;",
-	"jp,A,B,Y,X|P,R,L,Select;",
+	"J,Fire 1,Fire 2,Fire 3,Paddle Btn,Mod1,Mod2,Pause,Savestates;",
+	"jn,A,B,Y,X|P,R,L,Start,Select;",
+	"jp,A,B,Y,X|P,R,L,Start,Select;",
 	"V,v",`BUILD_DATE
 };
 
@@ -350,12 +353,12 @@ end
 wire [15:0] joyA,joyB,joyC,joyD;
 wire [15:0] joy = joyA | joyB | joyC | joyD;
 
-// pad "Savestates" button (joy[10]) is a modifier: the C64 does not see the
+// pad "Savestates" button (joy[11]) is a modifier: the C64 does not see the
 // joysticks while it is held and for ~10 ms after (savestate_ui)
 reg  [19:0] ss_combo_tail = 0;
-wire        ss_combo_hold = joy[10] | (ss_combo_tail != 0);
+wire        ss_combo_hold = joy[11] | (ss_combo_tail != 0);
 always @(posedge clk_sys) begin
-	if (joy[10]) ss_combo_tail <= 20'd320000;
+	if (joy[11]) ss_combo_tail <= 20'd320000;
 	else if (ss_combo_tail != 0) ss_combo_tail <= ss_combo_tail - 1'd1;
 end
 
@@ -364,7 +367,7 @@ wire        c64_pause_in;   // pause input of fpga64 (freeze, held until the syn
 wire        ss_freeze_req;  // savestate engine holds the machine (ss_freeze)
 
 // savestates (WP A2): signals used before the savestate section
-wire        ss_pause;       // pause input of fpga64 (OSD pause or savestate freeze)
+wire        ss_pause;       // pause input of fpga64 (user pause or savestate freeze)
 wire        ss_frz_ack;     // machine frozen for the savestate engine
 wire        c64_cpu_sync;   // C64 CPU between instructions
 wire        ss_kbd_eat;     // ps2_key event is a savestate hotkey
@@ -647,7 +650,7 @@ reu reu
 	.irq(reu_irq),
 
 	.ss_en(ss_chain_en),
-	.stop(c64_pause),             // machine stopped: OSD pause or savestate freeze
+	.stop(c64_pause),             // machine stopped: user pause or savestate freeze
 	.ss_hold(ss_frz_ack),
 	.ss_load_done(ss_load_done),
 	.ss_si(ss_dmax_so),
@@ -1477,15 +1480,41 @@ video_freak video_freak
 	.SCALE(status[31:30])
 );
 
+// User pause: the "Pause" pad button or the keyboard Pause/Break key toggle it.
+// It is released by any reset, by the start of a download or upload (PRG/CRT/TAP
+// injection and cartridge save need the bus running) and by a PAL/NTSC switch,
+// which resets the machine anyway.
+reg user_pause = 0;
+always @(posedge clk_sys) begin
+	reg old_pad, old_stb, old_dl, old_ul;
+
+	old_pad <= joy[10];
+	old_stb <= ps2_key[10];
+	old_dl  <= ioctl_download;
+	old_ul  <= ioctl_upload;
+
+	if(~old_pad & joy[10]) user_pause <= ~user_pause;
+	if((old_stb != ps2_key[10]) && (ps2_key[9:0] == 10'h377)) user_pause <= ~user_pause; // Pause/Break (make only)
+	if(~reset_n || (~old_dl & ioctl_download) || (~old_ul & ioctl_upload) || (ntsc_prev != ntsc)) user_pause <= 0;
+end
+
+wire pause_req = (OSD_STATUS & status[42]) | user_pause;
+
 // freeze changes only on a frame boundary of the scaler (freeze_sync), so HDMI
-// keeps a whole frame.
+// keeps a whole frame. With "Pause Dim Video" one more frame is let through
+// with the picture dimmed, then the machine and the scaler freeze on it.
 wire freeze_sync;
 reg freeze = 0;
+reg pause_dim = 0;
 always @(posedge clk_sys) begin
 	reg old_sync;
 	
 	old_sync <= freeze_sync;
-	if(old_sync ^ freeze_sync) freeze <= OSD_STATUS & status[42];
+	if(old_sync ^ freeze_sync) begin
+		if(~pause_req)                          {freeze, pause_dim} <= 2'b00;
+		else if(status[89] & ~freeze & ~pause_dim) pause_dim <= 1;
+		else                                     freeze <= 1;
+	end
 end
 
 // The machine stops on a C64 cycle, but restarts only when video_sync's
@@ -1534,6 +1563,10 @@ fpga64_rgbcolor out_palette
 	.b(vb)
 );
 
+wire [7:0] r_out = pause_dim ? {1'b0, vr[7:1]} : vr;
+wire [7:0] g_out = pause_dim ? {1'b0, vg[7:1]} : vg;
+wire [7:0] b_out = pause_dim ? {1'b0, vb[7:1]} : vb;
+
 assign HDMI_FREEZE = freeze | ss_frz_ack;
 
 ///////////////////////////////// savestates (WP A2) /////////////////////////////////
@@ -1578,7 +1611,7 @@ wire [8:0] ss_idle = {
 
 wire       ss_frz_forced;
 
-// A machine stopped away from a boundary (OSD pause) runs to the next one for
+// A machine stopped away from a boundary (user pause) runs to the next one for
 // the engine on the sample after vs_resume_ok, when the video output is on
 // the stopped VIC: the same timing as the pause release (pause_rel)
 reg        ss_run_ok = 0;
@@ -1842,7 +1875,7 @@ savestate_ui #(.INFO_TIMEOUT_BITS(25)) ss_ui
 	.clk(clk_sys),
 	.ps2_key(ps2_key),
 	.allow_ss(reset_n & ~ioctl_download & ~ioctl_upload),
-	.joySS(joy[10]),
+	.joySS(joy[11]),
 	.joyRight(joy[0]),
 	.joyLeft(joy[1]),
 	.joyDown(joy[2]),
@@ -2039,9 +2072,9 @@ video_mixer #(.GAMMA(1)) video_mixer
 	.gamma_bus(gamma_bus),
 
 	.ce_pix(ce_pix),
-	.R((ovl_color & 4) ? 8'hFF : ovl_color ? 8'h00 : vr),
-	.G((ovl_color & 2) ? 8'hFF : ovl_color ? 8'h00 : vg),
-	.B((ovl_color & 1) ? 8'hFF : ovl_color ? 8'h00 : vb),
+	.R((ovl_color & 4) ? 8'hFF : ovl_color ? 8'h00 : r_out),
+	.G((ovl_color & 2) ? 8'hFF : ovl_color ? 8'h00 : g_out),
+	.B((ovl_color & 1) ? 8'hFF : ovl_color ? 8'h00 : b_out),
 	.HSync(hsync_out),
 	.VSync(vsync_out),
 	.HBlank(hblank),
@@ -2191,8 +2224,26 @@ always @(posedge clk_sys) begin
 	aro <= ^arm[16:15] ? {arm[16], {15{arm[15]}}} : arm[15:0];
 end
 
-assign AUDIO_L = alo;
-assign AUDIO_R = aro;
+// Pause mute: while the machine is paused the mix fades out in 16 steps of
+// 6 dB (~2 ms each, 33 ms total) and fades back in on resume, so neither the
+// gate nor the frozen DC level of SID/OPL/DigiMax produce a click. It follows
+// the user/OSD pause (freeze), not the 2-3 frame stops of a savestate: those
+// hold the sound instead of dipping it.
+reg [4:0] pause_att = 0;
+always @(posedge clk_sys) begin
+	reg [15:0] div;
+
+	div <= div + 1'd1;
+	if(&div) begin
+		if(freeze & status[90]) begin
+			if(~pause_att[4]) pause_att <= pause_att + 1'd1;
+		end
+		else if(pause_att) pause_att <= pause_att - 1'd1;
+	end
+end
+
+assign AUDIO_L = pause_att[4] ? 16'd0 : ($signed(alo) >>> pause_att[3:0]);
+assign AUDIO_R = pause_att[4] ? 16'd0 : ($signed(aro) >>> pause_att[3:0]);
 assign AUDIO_S = 1;
 assign AUDIO_MIX = status[19:18];
 

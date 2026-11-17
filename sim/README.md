@@ -23,10 +23,10 @@ screenshots into PNG.
 sim/build.sh                       # full model  -> sim/build/obj/Vemu
 DRIVES=0 sim/build.sh              # no drives   -> sim/build/obj-nodrv/Vemu (~2x faster)
 sim/run_core.sh boot --shot ready.ppm
-sim/run_core.sh --nodrives pausetest
-sim/run_core.sh --nodrives pausetest --hold 5
+sim/run_core.sh --nodrives pausetest --trigger key
+sim/run_core.sh --nodrives pausetest --trigger joy --hold 5
 sim/run_core.sh --nodrives boot --prg game.prg --run-cycles 20000000 --shot game.ppm
-sim/tests/pause.sh                 # A0 acceptance: idle, tape, chip and cartridge scenarios
+sim/tests/pause.sh                 # A0 acceptance: key, pad button, tape scenarios
 ```
 
 `run_core.sh` builds the model if it is missing (`--rebuild` forces it) and
@@ -58,9 +58,9 @@ a real boot.
 ### Pause equivalence test
 
 Two instances of the core in lockstep, B is an exact copy of A at READY.
-B opens the OSD with "Pause When OSD is Open" on (status[42], `OSD_STATUS`
-high) at `--t0` clk_sys cycles, keeps it open for `--hold` video frames (PAL
-or NTSC 6567R8) after the machine stopped, then closes it. For every
+B gets the user pause at `--t0` clk_sys cycles (Pause/Break key, i.e.
+`ps2_key` = 0x377, or the "Pause" pad button, `joystick_0[10]`), stays paused
+for `--hold` video frames (PAL or NTSC 6567R8), then the same trigger releases it. For every
 clk_sys cycle in which the machine runs (`c64_pause == 0`) both instances
 produce one sample of C64-visible state:
 
@@ -75,8 +75,7 @@ paused time, which must be a whole number of C64 cycles (32 clk_sys). The
 test fails on the first differing sample and prints both values.
 
 `sim/tests/pause.sh` runs idle, tape, chip and cartridge scenarios on DRIVES=0,
-including NTSC (`--status 2`) and OPL with two- and three-stage FIFO crossings.
-Results of A0, with the user pause of branch `pause` as the trigger:
+including NTSC (`--status 2`) and OPL with two- and three-stage FIFO crossings:
 
 | Scenario | Trigger | Pause | Result |
 | --- | --- | --- | --- |
@@ -118,7 +117,7 @@ fetches the opcode at ADDR); the save goes through the OSD "Save state"
 option to slot 1, `--slot` writes the slot image read back from the DDRAM
 model. `sstest` is described in `sim/tests/savestate.sh` and
 `docs/SAVESTATES.md`. `ssdiff` (B3 differential): two instances in lockstep,
-B saves slot 2 at `--t0`, takes the OSD pause at `--t1`, saves slot 1, loads
+B saves slot 2 at `--t0`, takes the user pause at `--t1`, saves slot 1, loads
 slot 2, loads slot 1, saves slot 3 (must equal slot 1 byte for byte) and
 resumes; its running samples (the pausetest sample) must equal those of the
 uninterrupted A, so every live chain bit came back and nothing off the chain
@@ -138,9 +137,9 @@ with `--gap` running clocks between the points, excluding engine and
 video-alignment stops. The pause-release timeout stays at 2M clocks,
 below the hardware watchdog, so a watchdog-only release fails the regression.
 `--rewind --running` loads slot 2 while B runs (hotkey, or the OSD without
-Pause When OSD is Open) instead of inside the OSD pause; `--repause` also
-opens the OSD as the load ends, before the video-aligned resume, keeps it
-open two frames and closes it. `boot --load-slot f.ss --load-at C` powers on
+Pause When OSD is Open) instead of inside a user pause; `--repause` also
+presses Pause as the load ends, before the video-aligned resume, holds it
+two frames and releases it. `boot --load-slot f.ss --load-at C` powers on
 without READY and loads the slot from clk_sys C on, retrying once a frame
 while the engine refuses it (reset, RAM erase).
 
@@ -158,7 +157,7 @@ Main shows the video info). It also checks the VIC raster offsets
 rises at VIC X 407 PAL / 413 NTSC, vsync_out on VIC line 296 PAL / 12 NTSC,
 `vic_y` steps only at X 404 PAL / 420 NTSC, the machine stops at X = 8n+6.
 Every resume comes at most one frame after the release (the last fall of
-`freeze` or `ss_frz_ack`, or an engine request: a paused machine runs to
+`freeze` or `ss_frz_ack`, or an engine request: a user-paused machine runs to
 its savestate boundary only on the video position, `ss_freeze` `run_ok`), a
 stop that resumes on the VIC position it stopped on (plain pause, save, a
 load of the same state) lasts whole frames, and the pause release watchdog
@@ -180,7 +179,7 @@ Verification-hardening scenarios in the quick suite:
 | `paddles` | `--paddles`, Pot 1/2 = Paddles (status[27:26] = 2): all four writable host paddle lines vary every 8192 running clocks, independently in A/B. The same CPU POTX/POTY loop must write changing values to screen RAM before and after load; every running sample and the restored slot must match. |
 | `mousefreeze` | `--mouse-freeze`: one nonzero 1351 packet arrives 128 hold clocks into B's first save, another 128 hold clocks into its final load. A receives each at the same running-clock timestamp. Requires exact running samples, changing CPU POTX/POTY reads before/after resume, completed operations and both packets delivered. |
 | `opl`, `oplrewind`, `opl2`, `oplrewind2` | OPL replay with three- and two-stage FIFO pointer crossings. `--fifo-sync 0` selects the previous instantaneous model for diagnosis; READY caches are separate for each latency. |
-| `rewindrun`, `rewindpause`, `ntscrewind`, `efrun`, `reurewind`, `vic856x`, `vicearly`, `poweron` | Output sync across a load to another VIC position: `--rewind --running` on the tape LOAD, NTSC sid.prg, ef.crt, reu.prg (REU 512 KiB) and sid.prg with VIC-II 856x / Early 856x (status 34/35 at READY); `rewindpause` opens the OSD pause right after the load; `poweron` loads the slot of the `ready` scenario right after a cold start. `DRIVE=1` adds `drive1541rw` (load while running, inside the 1541 file transfer). |
+| `rewindrun`, `rewindpause`, `ntscrewind`, `efrun`, `reurewind`, `vic856x`, `vicearly`, `poweron` | Output sync across a load to another VIC position: `--rewind --running` on the tape LOAD, NTSC sid.prg, ef.crt, reu.prg (REU 512 KiB) and sid.prg with VIC-II 856x / Early 856x (status 34/35 at READY); `rewindpause` presses Pause right after the load; `poweron` loads the slot of the `ready` scenario right after a cold start. `DRIVE=1` adds `drive1541rw` (load while running, inside the 1541 file transfer). |
 
 `ssdiff.sh` also runs `tb/dcfifo_tb.sv`: flag/count visibility in both clock
 domains, showahead data, full/overflow, pointer wrap and asynchronous clear
@@ -195,7 +194,7 @@ periods must stay one line and one frame across plain pauses (whole
 frames) and loads to the middle of the frame, both sides of the VIC and the
 counter frame wraps, X 398 (and 406/414/422 NTSC) where the dot counter and
 the raster line step apart, the delayed last line, the last stop of the
-frame, the same position and a load followed by a pause, with the
+frame, the same position and a load followed by a user pause, with the
 resume at most a frame after the release; after running PAL/NTSC switches
 that leave the VIC outside the new frame a pause still resumes within a
 frame.
@@ -335,7 +334,7 @@ to the longest refresh gap, including clocks during an unfinished gap.
 The first 16 violations include clk64, nanoseconds, command, bank, row,
 address and `ss_sd_own`; summary totals, per-rule counts, clocks, refreshes,
 longest gaps and unwritten reads are split into `normal` and `engine`.
-`normal` means `ss_sd_own=0`, including pauses; `engine` means ownership
+`normal` means `ss_sd_own=0`, including user pauses; `engine` means ownership
 is asserted, whether the engine is accessing SDRAM or waiting for DDR3.
 Counters are part of READY snapshots, so summaries include boot history.
 An unwritten byte reads as zero and is information, not a violation; both

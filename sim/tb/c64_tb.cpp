@@ -4,12 +4,12 @@
 //       power on, run until "READY." is on the screen (or N frames), dump the
 //       last complete frame as PPM.
 //
-//   Vemu pausetest [--t0 C] [--hold F] [--after C]
+//   Vemu pausetest [--t0 C] [--hold F] [--after C] [--trigger key|joy]
 //                  [--max-frames N] [--prg file]
-//       two instances of the core in lockstep. A runs continuously, B opens
-//       the OSD with "Pause When OSD is Open" (status[42]) at clk_sys cycle C
-//       after READY and closes it F video frames (PAL 628992, NTSC 6567R8
-//       547040 clk_sys each) after the machine actually stopped.
+//       two instances of the core in lockstep. A runs continuously, B gets a
+//       user pause (Pause/Break key strobe or the "Pause" pad button) at
+//       clk_sys cycle C after READY, released F video frames (PAL 628992,
+//       NTSC 6567R8 547040 clk_sys each) after the machine actually stopped.
 //       Every clk_sys cycle in which the machine is running contributes one sample
 //       of C64-visible state (CPU address/data/we, RAM strobes, VIC RGB, CIA TOD
 //       source, cassette lines, audio mix). The two sample streams must be
@@ -57,7 +57,7 @@
 //   Vemu ssdiff [--ram-prg f.prg --kbuf 'RUN\r'] [--t0 C] [--t1 C] [--after C] [--slot prefix]
 //       B3 differential of the live chain segments: two instances in
 //       lockstep from READY (+PRG). B saves slot 2 at clk_sys C0, runs on to
-//       C1, takes the OSD pause, saves slot 1, loads slot 2 (an older state
+//       C1, takes the user pause, saves slot 1, loads slot 2 (an older state
 //       of every live segment and of the RAM), loads slot 1 and resumes. A
 //       runs on. Every running sample of B (pausetest sample) must equal A's:
 //       all live state came back from slot 1, and nothing outside the chain
@@ -73,7 +73,7 @@
 //       --mouse-freeze: send a packet during a save and another during a load.
 //       --turbo-check: require accelerated CPU cycles before and after loads.
 //       --fifo-sync 0|2|3: dcfifo pointer crossing stages (default 3, 0 legacy).
-//       --rewind: B saves slot 2 at C0, runs on to C1, takes the OSD pause,
+//       --rewind: B saves slot 2 at C0, runs on to C1, takes the user pause,
 //       loads slot 2 and resumes; from there every running sample of B must
 //       equal A's from C0 (a load of a state from another moment: registers
 //       rebuilt at the load must come from the loaded state); --slot writes
@@ -634,7 +634,7 @@ struct Sim {
 		m.vc_vs = v; m.vc_de = de;
 	}
 	// once per clk_sys: VIC line steps, stops of the machine (the release is
-	// the last fall of the OSD freeze or of the engine's freeze in the
+	// the last fall of the user/OSD freeze or of the engine's freeze in the
 	// stop, or an engine request, which lets a stopped machine run to a
 	// boundary: from there it waits for its video position, at most one
 	// frame) and the pause release watchdog
@@ -1342,9 +1342,6 @@ static int run_main(int argc, char **argv) {
 		unlink(bstate.c_str());
 		load(a, prg, tap, text, true);
 		load(b, prg, tap, text, false);
-		// B's pause is the OSD pause: "Pause When OSD is Open" on both, B opens the OSD (b_pause)
-		a.set_status_bit(42, true);
-		b.set_status_bit(42, true);
 		if (a.sys_cycles != b.sys_cycles) { printf("FAIL: runs differ before the test\n"); finish(1); }
 		a.sm.on = b.sm.on = true;   // output sync of both: A never stops, B saves, loads and pauses
 		a.sm.log = false;
@@ -1535,10 +1532,10 @@ static int run_main(int argc, char **argv) {
 			finish(1);
 		};
 		auto b_pause = [&](bool on) {
-			b.top->OSD_STATUS = on;   // OSD open with Pause When OSD is Open (status[42])
+			b.ps2(0x177, true);   // Pause/Break toggles the user pause
 			for (u64 i = 0; EMO(b, c64_pause) != on; i++) {
 				lockstep();
-				if (i > 2000000) { printf("FAIL: OSD pause %s\n", on ? "not taken" : "not released"); finish(1); }
+				if (i > 2000000) { printf("FAIL: user pause %s\n", on ? "not taken" : "not released"); finish(1); }
 			}
 		};
 		// --opl, after the resume: B's queue consumed within one frame, then the
@@ -1692,8 +1689,8 @@ static int run_main(int argc, char **argv) {
 
 		if (rewind) {
 			// --running: the load comes while B runs (hotkey, or the OSD without
-			// Pause When OSD is Open), no OSD pause around it; --repause: and the
-			// OSD opens as the load ends, before the video-aligned resume
+			// Pause When OSD is Open), no user pause around it; --repause: and the
+			// user pause is pressed as the load ends, before the video-aligned resume
 			bool repause = has(argc, argv, "--repause"), running = repause || has(argc, argv, "--running");
 			run_to_c(t0c);
 			rec_armed = true;
@@ -1706,9 +1703,9 @@ static int run_main(int argc, char **argv) {
 			rewound = true;
 			phase = "resume";
 			if (repause) {
-				b.top->OSD_STATUS = 1;
+				b.ps2(0x177, true);
 				for (u64 c = b.sys_cycles + 2 * b.frame_cycles(); b.sys_cycles < c;) lockstep();
-				if (!EMO(b, freeze) || !EMO(b, c64_pause)) { printf("FAIL: OSD pause right after the load not taken\n"); finish(1); }
+				if (!EMO(b, user_pause) || !EMO(b, c64_pause)) { printf("FAIL: user pause right after the load not taken\n"); finish(1); }
 				b_pause(false);
 			}
 			else if (!running) b_pause(false);
@@ -1718,7 +1715,7 @@ static int run_main(int argc, char **argv) {
 			opl_checks();
 			sync_checks();
 			printf("PASS: rewind%s, %llu samples after the load equal A's from C0 (%llu recorded)\n",
-				repause ? " (load while running, OSD pause right after it)" : running ? " (load while running)" : "",
+				repause ? " (load while running, user pause right after it)" : running ? " (load while running)" : "",
 				(unsigned long long)rj, (unsigned long long)rec.size());
 			finish(0);
 		}
@@ -1786,6 +1783,7 @@ static int run_main(int argc, char **argv) {
 		u64 t0c = strtoull(arg(argc, argv, "--t0", "200000"), nullptr, 0);
 		int hold = atoi(arg(argc, argv, "--hold", "3"));
 		u64 after = strtoull(arg(argc, argv, "--after", "2000000"), nullptr, 0);
+		bool joy = !strcmp(arg(argc, argv, "--trigger", "key"), "joy");
 		Sim a("a", g_opl, g_clk50), b("b", g_opl, g_clk50);
 		apply_status(a);
 		reach_ready(a, max_frames, true);
@@ -1796,9 +1794,6 @@ static int run_main(int argc, char **argv) {
 		unlink(bstate.c_str());
 		load(a, prg, tap, text, true);
 		load(b, prg, tap, text, false);
-		// the pause: "Pause When OSD is Open" on both, B opens and closes the OSD
-		a.set_status_bit(42, true);
-		b.set_status_bit(42, true);
 		a.sm.on = b.sm.on = true;   // output sync and resolution across the pause (and the --load-slot loads)
 		// --load-slot: both start from a slot image (e.g. saved on the board)
 		if (const char *slot_in = arg(argc, argv, "--load-slot", nullptr)) {
@@ -1817,6 +1812,11 @@ static int run_main(int argc, char **argv) {
 		int phase = 0;  // 0 before, 1 requested, 2 paused, 3 released, 4 resumed
 		u64 base = a.sys_cycles, fstart = 0;
 		double tstart = now();
+		auto press = [&](Sim &s, bool on) {
+			if (joy) EMO(s, hps_io__DOT__h_joy0) = on ? (1u << 10) : 0;
+			else if (on) s.ps2(0x177, true);  // Pause/Break: hps_io reports 0x377 (pressed, ext, 0x77)
+		};
+		u64 joy_release = 0;
 		u64 a_read_edges = 0, a_motor_cycles = 0, a_opl_changes = 0;
 		bool a_old_read = false;
 		uint16_t a_old_opl = 0;
@@ -1824,12 +1824,13 @@ static int run_main(int argc, char **argv) {
 			a.step();
 			b.step();
 			u64 c = b.sys_cycles - base;
-			if (phase == 0 && c == t0c) { b.top->OSD_STATUS = 1; phase = 1; pause_req_at = c; }
+			if (phase == 0 && c == t0c) { press(b, true); joy_release = c + 2000; phase = 1; pause_req_at = c; }
+			if (joy && joy_release && c == joy_release) { press(b, false); joy_release = 0; }
 			if (phase == 1 && EMO(b, c64_pause)) { phase = 2; fstart = c; printf("B paused at +%llu (request at +%llu)\n", (unsigned long long)c, (unsigned long long)pause_req_at); }
 			if (phase == 2) {
 				// check that nothing visible moves while paused
 				// Core video stops; use the selected VIC's line/frame dimensions.
-				if (c >= fstart + (u64)hold * b.frame_cycles()) { b.top->OSD_STATUS = 0; phase = 3; release_at = c; }
+				if (c >= fstart + (u64)hold * b.frame_cycles()) { press(b, true); joy_release = c + 2000; phase = 3; release_at = c; }
 			}
 			// from the request on: a --load-slot freeze before t0 is not the pause
 			if (phase >= 1 && EMO(b, c64_pause) && EMO(b, reset_n)) paused_cycles++;

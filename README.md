@@ -2,12 +2,13 @@
 
 Based on FPGA64 by Peter Wendrich with heavy later modifications by different people.
 
-## Savestates (unofficial build)
+## Savestates and a Pause button (unofficial build)
 
-This branch adds four savestate slots. It is an unofficial test build, not from MiSTer-devel: builds are in [Releases](https://github.com/Bruc3Dev573/C64_MiSTer/releases), and problems go [here](https://github.com/Bruc3Dev573/C64_MiSTer/issues), not to the official repo.
+This branch adds four savestate slots and a Pause button. It is an unofficial one-off test build, not from MiSTer-devel: builds are in [Releases](https://github.com/Bruc3Dev573/C64_MiSTer/releases), and problems go [here](https://github.com/Bruc3Dev573/C64_MiSTer/issues), not to the official repo. The regular build, without the Pause button, is on branch [`savestates`](https://github.com/Bruc3Dev573/C64_MiSTer/tree/savestates).
 
 | Control | Effect |
 |---|---|
+| Keyboard **Pause/Break**, pad **Pause** (default Start) | Pause and resume. The picture stays on screen, also on the analog output. OSD **Pause Dim Video** and **Pause Mute Audio** dim the picture and fade the sound while paused |
 | Pad: hold **Savestates** (default Select), then **Down** / **Up** | Save to / load the selected slot |
 | Pad: hold **Savestates**, then **Left** / **Right**; keyboard **Ctrl+Alt+F1-F4** | Select slot 1-4 |
 | OSD **Save state** / **Restore state**, **Savestate Slot** | The same from the OSD |
@@ -21,9 +22,9 @@ Known limits:
 
 - With the 16 MB REU a save is refused ("REU too large for the slot").
 - Load a state with the same settings it was saved with: REU size, GeoRAM, cartridge type, drive types, SID models, PAL/NTSC, VIC-II and CIA models, Sound Expander and System ROM. Otherwise the load is refused.
-- RS-232 and external IEC devices are real-time links: data that arrives during a save or a load is lost.
+- RS-232 and external IEC devices are real-time links: data that arrives while paused or during a save or a load is lost.
 
-Details: [docs/SAVESTATES.md](docs/SAVESTATES.md), [docs/PAUSE.md](docs/PAUSE.md) (how the machine stops).
+Details: [docs/SAVESTATES.md](docs/SAVESTATES.md), [docs/PAUSE.md](docs/PAUSE.md).
 
 ## Features
 - C64 and C64GS modes

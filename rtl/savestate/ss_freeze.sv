@@ -1,5 +1,5 @@
 // Savestate freeze controller (WP A2): second freeze level on top of the
-// OSD pause (docs/PAUSE.md).
+// user pause (docs/PAUSE.md).
 //
 // fpga64_sid_iec samples its pause input once per C64 cycle group, on the
 // clk_sys edge where it also raises 'refresh' (preCycle = pred(CYCLE_EXT4),
@@ -9,9 +9,9 @@
 // them are idle (C64 CPU between instructions, no reset pending, no REU DMA,
 // no disk or download transfer, ...). Each block exposes only its idle
 // signal. Once stopped on such a sample the freeze is held until req drops,
-// then the pause input goes back to the OSD pause.
+// then the pause input goes back to the user pause.
 //
-// If the machine was already stopped at an arbitrary point (OSD pause, the
+// If the machine was already stopped at an arbitrary point (user pause, the
 // video realignment after one) it is let run again until the next boundary
 // (a few cycles, HDMI keeps the frozen frame), starting on a sample where
 // run_ok is high: c64.sv gives it on the sample after video_sync's resume_ok,
@@ -26,7 +26,7 @@ module ss_freeze #(parameter N = 9, parameter WDOG_BITS = 27)
 (
 	input              clk,
 	input              req,         // savestate engine wants the machine frozen
-	input              user_pause,  // existing freeze (OSD pause, held until the video realigns)
+	input              user_pause,  // existing freeze (user / OSD pause)
 	input              run_ok,      // a stopped machine may run on this sample
 	input              sample,      // fpga64 'refresh': pause was sampled on this edge
 	input              c64_pause,   // fpga64 pause_out

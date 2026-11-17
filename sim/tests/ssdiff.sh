@@ -46,7 +46,7 @@
 # every save, load and pause, video_calc's resolution unchanged, the
 # resume at most a frame after the release, a stop back on its VIC position
 # whole frames. rewindrun/rewindpause/ntscrewind/efrun/reurewind/vic856x/
-# vicearly load another VIC position while B runs (rewindpause: OSD pause
+# vicearly load another VIC position while B runs (rewindpause: user pause
 # right after the load); poweron loads right after a cold start.
 set -euo pipefail
 
@@ -229,7 +229,7 @@ for p in $TESTS; do   # JOBS instances at a time (two models each)
 		*/slotphase.extra) run "$n" --ram-prg "$OUT/sid.prg" --kbuf 'RUN\r' --slotphase --t0 1500000 --gap 1000000 --after 3000000 & ;;
 		# loads to another VIC position (every scenario checks the output sync,
 		# c64_tb.cpp sync_mon): while running (hotkey, or the OSD without Pause
-		# When OSD is Open), with the OSD pause taken right after the load,
+		# When OSD is Open), with the user pause pressed right after the load,
 		# NTSC, EasyFlash, REU, the 856x VIC variants, and a load right after
 		# power on (no READY, the slot of the ready scenario)
 		*/rewindrun.extra) STATUS=$st run "$n" --status-ready 96 --tap "$OUT/vartap.tap" --kbuf 'LOAD\r' --t0 1500000 --t1 4000000 --after 3000000 --rewind --running & ;;

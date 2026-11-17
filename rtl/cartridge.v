@@ -5,7 +5,7 @@
 
 	Savestate (WP A7): the cartridge logic and the EasyFlash flash chips step
 	on every clock with the bus strobes, so they hold while the machine is
-	stopped (pause = OSD pause or savestate freeze). Chain: ss_si -> ez_rom
+	stopped (pause = user pause or savestate freeze). Chain: ss_si -> ez_rom
 	(flash 1, flash 0, its arbiter) -> the registers below -> ss_so; field
 	order in savestate/map.yaml (CART, after the DigiMax of c64.sv).
 */
