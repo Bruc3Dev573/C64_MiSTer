@@ -2,6 +2,15 @@
 //	REU implementation.
 // (C)2021 Alexey Melnikov
 //
+// Savestate (WP A7): the REU runs on every clock but steps with the machine
+// grid (dma_cycle, ram_cycle), so all of it holds while the machine is
+// stopped (stop = pause or savestate freeze): it resumes exactly where it
+// was cut, and nothing moves while the chain shifts. The freeze only happens
+// with no DMA in flight. The outputs drive the bus, the SDRAM port and the
+// IRQ line on every clock: they never shift, the chain carries copies (ss_*)
+// that follow them until ss_hold (one clock after the last change, the
+// machine is stopped by then) and are written back on ss_load_done. Field
+// order: savestate/map.yaml.
 
 module reu
 (
@@ -30,16 +39,48 @@ module reu
 	input             cpu_we,
 	input             cpu_cs,
 
-	output reg        irq
+	output reg        irq,
+
+	// savestate scan chain
+	input             ss_en,
+	input             stop,
+	input             ss_hold,
+	input             ss_load_done,
+	input             ss_si,
+	output            ss_so
 );
+
+reg        old_we;
+reg        old_cs;
+reg  [1:0] state;
+reg  [3:0] cnt;
+reg  [7:0] data[2];
+reg [15:0] addr_c64, addr_c64_r;
+reg [23:0] addr_ram, addr_ram_r;
+reg [15:0] length, length_r;
+reg  [7:0] cmd;
+reg  [7:0] intr;
+reg  [7:0] ctl;
+reg  [7:0] status;
+
+// savestate: copies of the outputs, the segment vector and its shifted value
+reg        ss_dma_req, ss_dma_we_r, ss_ram_we, ss_irq;
+reg [15:0] ss_dma_addr;
+reg  [7:0] ss_dma_dout, ss_ram_dout, ss_cpu_din;
+reg [24:0] ss_ram_addr;
+wire [260:0] ss_q, ss_d;
 
 reg ff00_wr;
 always @(posedge clk) begin
-	reg old_we;
-	
-	old_we <= cpu_we;
-	ff00_wr <= 0;
-	if(~old_we && cpu_we && cpu_addr == 'hFF00) ff00_wr <= 1;
+	if (!stop) begin
+		old_we <= cpu_we;
+		ff00_wr <= 0;
+		if(~old_we && cpu_we && cpu_addr == 'hFF00) ff00_wr <= 1;
+	end
+	if (ss_en) begin
+		ff00_wr <= ss_d[150];
+		old_we  <= ss_d[193];
+	end
 end
 
 localparam STATE_IDLE     = 0;
@@ -58,24 +99,14 @@ reg dma_we_r;
 assign dma_we = dma_we_r & dma_cycle;
 
 always @(posedge clk) begin
-	reg        old_cs;
-	reg  [1:0] state;
-	reg  [3:0] cnt;
-	reg  [7:0] data[2];
-	reg [15:0] addr_c64, addr_c64_r;
-	reg [23:0] addr_ram, addr_ram_r;
-	reg [15:0] length, length_r;
-	reg  [7:0] cmd;
-	reg  [7:0] intr;
-	reg  [7:0] ctl;
 	reg [23:0] addr_mask;
-	reg  [7:0] status;
 	reg        error;
-	
-	irq <= (|(status[6:5] & intr[6:5])) & intr[7];
 
 	error = !op_act[0] && data[0] != data[1];
 	addr_mask = ((cfg == 1) ? 24'h7FFFF : (cfg == 2) ? 24'h1FFFFF : 24'hFFFFFF);
+
+	if (!stop) begin
+	irq <= (|(status[6:5] & intr[6:5])) & intr[7];
 
 	old_cs <= cpu_cs;
 
@@ -210,6 +241,58 @@ always @(posedge clk) begin
 				end
 		endcase
 	end
+	end
+
+	if (ss_en) begin
+		{status, state, stage}                                       <= ss_d[260:248];
+		op                                                           <= ss_d[213:194];
+		{old_cs, length_r, length}                                   <= ss_d[192:160];
+		intr                                                         <= ss_d[158:151];
+		{data[1], data[0], ctl}                                      <= ss_d[123:100];
+		{cnt, cmd, addr_ram_r, addr_ram, addr_c64_r, addr_c64}       <= ss_d[91:0];
+	end
+	if (ss_load_done) begin
+		dma_req  <= ss_dma_req;
+		dma_addr <= ss_dma_addr;
+		dma_dout <= ss_dma_dout;
+		dma_we_r <= ss_dma_we_r;
+		ram_addr <= ss_ram_addr;
+		ram_dout <= ss_ram_dout;
+		ram_we   <= ss_ram_we;
+		irq      <= ss_irq;
+		cpu_din  <= ss_cpu_din;
+	end
 end
+
+always @(posedge clk) begin
+	if (ss_en) begin
+		ss_cpu_din  <= ss_d[99:92];
+		ss_dma_addr <= ss_d[139:124];
+		ss_dma_dout <= ss_d[147:140];
+		ss_dma_req  <= ss_d[148];
+		ss_dma_we_r <= ss_d[149];
+		ss_irq      <= ss_d[159];
+		ss_ram_addr <= ss_d[238:214];
+		ss_ram_dout <= ss_d[246:239];
+		ss_ram_we   <= ss_d[247];
+	end
+	else if (!ss_hold) begin
+		ss_cpu_din  <= cpu_din;
+		ss_dma_addr <= dma_addr;
+		ss_dma_dout <= dma_dout;
+		ss_dma_req  <= dma_req;
+		ss_dma_we_r <= dma_we_r;
+		ss_irq      <= irq;
+		ss_ram_addr <= ram_addr;
+		ss_ram_dout <= ram_dout;
+		ss_ram_we   <= ram_we;
+	end
+end
+
+assign ss_q = {status, state, stage, ss_ram_we, ss_ram_dout, ss_ram_addr, op, old_we, old_cs, length_r, length,
+               ss_irq, intr, ff00_wr, ss_dma_we_r, ss_dma_req, ss_dma_dout, ss_dma_addr, data[1], data[0], ctl,
+               ss_cpu_din, cnt, cmd, addr_ram_r, addr_ram, addr_c64_r, addr_c64};
+assign ss_d = {ss_si, ss_q[260:1]};
+assign ss_so = ss_q[0];
 
 endmodule

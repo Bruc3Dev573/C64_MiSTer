@@ -79,7 +79,12 @@ entity fpga64_buslogic is
 		cs_ioF      : out std_logic;
 		cs_romL     : out std_logic;
 		cs_romH     : out std_logic;
-		cs_UMAXromH : out std_logic
+		cs_UMAXromH : out std_logic;
+
+		-- savestate scan chain (segment SYS, last three bits: gs, jap, std)
+		ss_en       : in  std_logic := '0';
+		ss_si       : in  std_logic := '0';
+		ss_so       : out std_logic
 	);
 end fpga64_buslogic;
 
@@ -204,8 +209,14 @@ begin
 				c64std_ena <= bios(0);
 				c64jap_ena <= bios(1) and bios(0);
 			end if;
+			if ss_en = '1' then
+				c64gs_ena  <= c64jap_ena;
+				c64jap_ena <= c64std_ena;
+				c64std_ena <= ss_si;
+			end if;
 		end if;
 	end process;
+	ss_so <= c64gs_ena;
 
 	--
 	--begin

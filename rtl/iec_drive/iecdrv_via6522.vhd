@@ -55,8 +55,16 @@ port (
     cb2_o       : out std_logic;
     cb2_i       : in  std_logic;
     cb2_t       : out std_logic;
+    irq         : out std_logic;
 
-    irq         : out std_logic );
+    -- savestate scan chain (WP A8, docs/SAVESTATES.md): ss_en shifts every
+    -- register by one bit (ss_si in at the top, bit 0 out on ss_so); ss_stop
+    -- (the drive is stopped with the machine) holds the logic that runs on
+    -- every clock (edge detectors, port input registers, read data, resets).
+    ss_en       : in  std_logic := '0';
+    ss_stop     : in  std_logic := '0';
+    ss_si       : in  std_logic := '0';
+    ss_so       : out std_logic );
     
 end iecdrv_via6522;
 
@@ -156,9 +164,41 @@ architecture Gideon of iecdrv_via6522 is
     signal cb2_handshake_o  : std_logic;
     signal cb2_pulse_o      : std_logic;
     signal shift_active     : std_logic;
+
+    -- registers of the timer and shift register blocks (declared here for the chain)
+    signal timer_a_reload        : std_logic;
+    signal timer_a_toggle        : std_logic;
+    signal timer_a_may_interrupt : std_logic;
+    signal timer_b_reload_lo     : std_logic;
+    signal timer_b_oneshot_trig  : std_logic;
+    signal timer_b_timeout       : std_logic;
+    signal pb6_c, pb6_d          : std_logic;
+    signal shift_clock_d         : std_logic;
+    signal shift_clock           : std_logic;
+    signal shift_timer_tick      : std_logic;
+    signal bit_cnt               : integer range 0 to 7;
+
+    signal data_out_r       : std_logic_vector(7 downto 0);
+
+    -- savestate chain, bit 0 leaves first (field order of savestate/map.yaml,
+    -- via1_/via2_ fields of DRV8_1541/DRV9_1541); phi2_ref is not connected
+    -- in the drives and stays off the chain
+    constant SS_W : natural := 206;
+    signal ss_q, ss_d       : std_logic_vector(SS_W-1 downto 0);
 begin
     irq <= irq_out;
-    
+    data_out <= data_out_r;
+
+    ss_q <= shift_active & conv_std_logic_vector(bit_cnt, 3) & shift_timer_tick & shift_clock_d & shift_clock & shift_reg &
+            pb6_d & pb6_c & timer_b_tick & timer_b_timeout & timer_b_oneshot_trig & timer_b_reload_lo & timer_b_count &
+            timer_a_toggle & timer_a_may_interrupt & timer_a_reload & timer_a_count &
+            cb2_pulse_o & cb2_handshake_o & ca2_pulse_o & ca2_handshake_o &
+            cb2_d2 & cb2_d1 & cb2_c & cb1_d2 & cb1_d1 & cb1_c & ca2_d2 & ca2_d1 & ca2_c & ca1_d2 & ca1_d1 & ca1_c &
+            data_out_r & port_b_c & port_a_c & irb & ira & timer_b_latch & timer_a_latch & irq_flags & irq_mask &
+            pcr & acr & pio_i.ddrb & pio_i.prb & pio_i.ddra & pio_i.pra;
+    ss_d  <= ss_si & ss_q(SS_W-1 downto 1);
+    ss_so <= ss_q(0);
+
     write_t1c_l <= '1' when (addr = X"4" or addr = x"6") and wen='1' and falling = '1' else '0';
     write_t1c_h <= '1' when addr = X"5" and wen='1' and falling = '1' else '0';
     write_t2c_h <= '1' when addr = X"9" and wen='1' and falling = '1' else '0';
@@ -212,6 +252,7 @@ begin
     
 
     process(clock)
+        variable v : std_logic_vector(SS_W-1 downto 0);
     begin
         if rising_edge(clock) then            
             -- CA1/CA2/CB1/CB2 edge detect flipflops
@@ -348,44 +389,44 @@ begin
             end if;
             
             -- Reads - Output only --
-            data_out <= X"00";
+            data_out_r <= X"00";
             case addr is
             when X"0" => -- ORB
                 --Port B reads its own output register for pins set to output.
-                data_out <= (pio_i.prb and pio_i.ddrb) or (irb and not pio_i.ddrb);
+                data_out_r <= (pio_i.prb and pio_i.ddrb) or (irb and not pio_i.ddrb);
                 if tmr_a_output_en='1' then
-                    data_out(7) <= timer_a_out;
+                    data_out_r(7) <= timer_a_out;
                 end if;
             when X"1" => -- ORA
-                data_out <= ira;
+                data_out_r <= ira;
             when X"2" => -- DDRB
-                data_out <= pio_i.ddrb;
+                data_out_r <= pio_i.ddrb;
             when X"3" => -- DDRA
-                data_out <= pio_i.ddra;
+                data_out_r <= pio_i.ddra;
             when X"4" => -- TA LO counter
-                data_out <= timer_a_count(7 downto 0);
+                data_out_r <= timer_a_count(7 downto 0);
             when X"5" => -- TA HI counter
-                data_out <= timer_a_count(15 downto 8);
+                data_out_r <= timer_a_count(15 downto 8);
             when X"6" => -- TA LO latch
-                data_out <= timer_a_latch(7 downto 0);
+                data_out_r <= timer_a_latch(7 downto 0);
             when X"7" => -- TA HI latch
-                data_out <= timer_a_latch(15 downto 8);
+                data_out_r <= timer_a_latch(15 downto 8);
             when X"8" => -- TA LO counter
-                data_out <= timer_b_count(7 downto 0);
+                data_out_r <= timer_b_count(7 downto 0);
             when X"9" => -- TA HI counter
-                data_out <= timer_b_count(15 downto 8);
+                data_out_r <= timer_b_count(15 downto 8);
             when X"A" => -- SR
-                data_out  <= shift_reg;
+                data_out_r  <= shift_reg;
             when X"B" => -- ACR
-                data_out  <= acr;
+                data_out_r  <= acr;
             when X"C" => -- PCR
-                data_out  <= pcr;
+                data_out_r  <= pcr;
             when X"D" => -- IFR
-                data_out  <= irq_out & irq_flags;
+                data_out_r  <= irq_out & irq_flags;
             when X"E" => -- IER
-                data_out  <= '0' & irq_mask;
+                data_out_r  <= '0' & irq_mask;
             when X"F" => -- ORA
-                data_out  <= ira;
+                data_out_r  <= ira;
             when others =>
                 null;
             end case;
@@ -446,6 +487,43 @@ begin
                 timer_a_latch  <= latch_reset_pattern;
                 timer_b_latch  <= latch_reset_pattern;
             end if;
+
+            -- savestate: ss_en shifts the chain, ss_stop holds every register
+            -- (the last assignment of the process wins)
+            if ss_en = '1' or ss_stop = '1' then
+                if ss_en = '1' then v := ss_d; else v := ss_q; end if;
+                pio_i.pra       <= v(7 downto 0);
+                pio_i.ddra      <= v(15 downto 8);
+                pio_i.prb       <= v(23 downto 16);
+                pio_i.ddrb      <= v(31 downto 24);
+                acr             <= v(39 downto 32);
+                pcr             <= v(47 downto 40);
+                irq_mask        <= v(54 downto 48);
+                irq_flags       <= v(61 downto 55);
+                timer_a_latch   <= v(77 downto 62);
+                timer_b_latch   <= v(93 downto 78);
+                ira             <= v(101 downto 94);
+                irb             <= v(109 downto 102);
+                port_a_c        <= v(117 downto 110);
+                port_b_c        <= v(125 downto 118);
+                data_out_r      <= v(133 downto 126);
+                ca1_c           <= v(134);
+                ca1_d1          <= v(135);
+                ca1_d2          <= v(136);
+                ca2_c           <= v(137);
+                ca2_d1          <= v(138);
+                ca2_d2          <= v(139);
+                cb1_c           <= v(140);
+                cb1_d1          <= v(141);
+                cb1_d2          <= v(142);
+                cb2_c           <= v(143);
+                cb2_d1          <= v(144);
+                cb2_d2          <= v(145);
+                ca2_handshake_o <= v(146);
+                ca2_pulse_o     <= v(147);
+                cb2_handshake_o <= v(148);
+                cb2_pulse_o     <= v(149);
+            end if;
         end if;
     end process;
 
@@ -461,9 +539,6 @@ begin
 
     -- Timer A
     tmr_a: block
-        signal timer_a_reload        : std_logic;
-        signal timer_a_toggle        : std_logic;
-        signal timer_a_may_interrupt : std_logic;
     begin
         process(clock)
         begin
@@ -507,6 +582,18 @@ begin
                     timer_a_count  <= latch_reset_pattern;
                     timer_a_reload <= '0';
                 end if;
+
+                if ss_en = '1' then
+                    timer_a_count         <= ss_d(165 downto 150);
+                    timer_a_reload        <= ss_d(166);
+                    timer_a_may_interrupt <= ss_d(167);
+                    timer_a_toggle        <= ss_d(168);
+                elsif ss_stop = '1' then
+                    timer_a_count         <= timer_a_count;
+                    timer_a_reload        <= timer_a_reload;
+                    timer_a_may_interrupt <= timer_a_may_interrupt;
+                    timer_a_toggle        <= timer_a_toggle;
+                end if;
             end if;
         end process;
 
@@ -517,10 +604,6 @@ begin
     
     -- Timer B
     tmr_b: block
-        signal timer_b_reload_lo     : std_logic;
-        signal timer_b_oneshot_trig  : std_logic;
-        signal timer_b_timeout       : std_logic;
-        signal pb6_c, pb6_d          : std_logic;
     begin
         process(clock)
             variable timer_b_decrement   : std_logic;
@@ -579,6 +662,24 @@ begin
                     timer_b_reload_lo    <= '0';
                     timer_b_oneshot_trig <= '0';                    
                 end if;
+
+                if ss_en = '1' then
+                    timer_b_count        <= ss_d(184 downto 169);
+                    timer_b_reload_lo    <= ss_d(185);
+                    timer_b_oneshot_trig <= ss_d(186);
+                    timer_b_timeout      <= ss_d(187);
+                    timer_b_tick         <= ss_d(188);
+                    pb6_c                <= ss_d(189);
+                    pb6_d                <= ss_d(190);
+                elsif ss_stop = '1' then
+                    timer_b_count        <= timer_b_count;
+                    timer_b_reload_lo    <= timer_b_reload_lo;
+                    timer_b_oneshot_trig <= timer_b_oneshot_trig;
+                    timer_b_timeout      <= timer_b_timeout;
+                    timer_b_tick         <= timer_b_tick;
+                    pb6_c                <= pb6_c;
+                    pb6_d                <= pb6_d;
+                end if;
             end if;
         end process;
 
@@ -588,12 +689,8 @@ begin
     
     ser: block
         signal trigger_serial: std_logic;
-        signal shift_clock_d : std_logic;
-        signal shift_clock   : std_logic;
         signal shift_tick_r  : std_logic;
         signal shift_tick_f  : std_logic;
-        signal shift_timer_tick : std_logic;
-        signal bit_cnt       : integer range 0 to 7;
         signal shift_pulse   : std_logic;
     begin
         process(shift_active, timer_b_tick, shift_clk_sel, shift_clock, shift_clock_d, shift_timer_tick)
@@ -652,6 +749,16 @@ begin
                     shift_clock <= '1';
                     shift_clock_d <= '1';
                 end if;
+
+                if ss_en = '1' then
+                    shift_clock      <= ss_d(199);
+                    shift_clock_d    <= ss_d(200);
+                    shift_timer_tick <= ss_d(201);
+                elsif ss_stop = '1' then
+                    shift_clock      <= shift_clock;
+                    shift_clock_d    <= shift_clock_d;
+                    shift_timer_tick <= shift_timer_tick;
+                end if;
             end if;
         end process;
 
@@ -677,6 +784,12 @@ begin
                     elsif shift_dir='0' and shift_tick_r = '1' then -- input
                         shift_reg <= shift_reg(6 downto 0) & cb2_d1;
                     end if;
+                end if;
+
+                if ss_en = '1' then
+                    shift_reg <= ss_d(198 downto 191);
+                elsif ss_stop = '1' then
+                    shift_reg <= shift_reg;
                 end if;
             end if;
         end process;        
@@ -709,6 +822,14 @@ begin
                 if reset='1' then
                     shift_active <= '0';
                     bit_cnt      <= 0;
+                end if;
+
+                if ss_en = '1' then
+                    bit_cnt      <= conv_integer(ss_d(204 downto 202));
+                    shift_active <= ss_d(205);
+                elsif ss_stop = '1' then
+                    bit_cnt      <= bit_cnt;
+                    shift_active <= shift_active;
                 end if;
             end if;
         end process;                

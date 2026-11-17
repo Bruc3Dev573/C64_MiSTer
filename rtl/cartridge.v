@@ -2,12 +2,19 @@
 	CRT cartridge handling for C64 L.C.Ashmore 2017
 
 	Improvements by Sorgelig
+
+	Savestate (WP A7): the cartridge logic and the EasyFlash flash chips step
+	on every clock with the bus strobes, so they hold while the machine is
+	stopped (pause = OSD pause or savestate freeze). Chain: ss_si -> ez_rom
+	(flash 1, flash 0, its arbiter) -> the registers below -> ss_so; field
+	order in savestate/map.yaml (CART, after the DigiMax of c64.sv).
 */
 
 module cartridge
 (
 	input             clk32,				 	// 32mhz clock source
 	input             reset_n,					// reset signal
+	input             pause,					// C64 paused (pause_out of fpga64)
 
 	input             cart_loading,
 	input       [7:0] cart_id,					// cart ID or cart type
@@ -49,8 +56,17 @@ module cartridge
 	input             freeze_key,
 	input             mod_key,
 	output reg        nmi,
-	input             nmi_ack
+	input             nmi_ack,
+
+	// savestate scan chain
+	input             ss_en,
+	input             ss_hold,
+	input             ss_load_done,
+	input             ss_si,
+	output            ss_so
 );
+
+wire [103:0] ss_q, ss_d;   // savestate segment vector and its shifted value
 
 reg  [7:0] bank_lo;
 reg  [7:0] bank_hi;
@@ -109,8 +125,11 @@ reg romH_we = 0;
 
 reg old_ioe, old_iof;
 always @(posedge clk32) begin
-	old_ioe <= IOE;
-	old_iof <= IOF;
+	if (ss_en) {old_iof, old_ioe} <= ss_d[97:96];
+	else if (!pause) begin
+		old_ioe <= IOE;
+		old_iof <= IOF;
+	end
 end
 
 wire stb_ioe = (~old_ioe & IOE);
@@ -137,18 +156,27 @@ reg  clock_port;
 reg  rom_kbb;
 reg  force_ultimax;
 reg  ezrom_en;
+reg        init_n = 0;
+reg        allow_freeze = 0;
+reg        saved_d6 = 0;
+reg [15:0] count;
+reg        count_ena;
+
+wire ss_ez_so;
+assign ss_q = {saved_d6, rom_kbb, romL_we, romH_we, reu_map, old_nmiack, old_iof, old_ioe, old_freeze, nmi,
+               mask_lo, init_n, geo_bank, game_overide, ezrom_en, exrom_overide, count_ena, count, clock_port,
+               cart_disable, bank_no, bank_lo, bank_hi, allow_freeze, allow_bank, IOF_wr_ena, IOF_ena, IOF_bank,
+               IOE_wr_ena, IOE_ena, IOE_bank};
+assign ss_d = {ss_ez_so, ss_q[103:1]};
+assign ss_so = ss_q[0];
 
 // 0018 - EXROM line status
 // 0019 - GAME line status
 
 always @(posedge clk32) begin
-	reg        init_n = 0;
-	reg        allow_freeze = 0;
-	reg        saved_d6 = 0;
-	reg [15:0] count;
-	reg        count_ena;
 	reg [15:0] old_id;
 
+	if (!pause) begin
 	old_freeze <= freeze_key;
 	if(freeze_req & (allow_freeze | mod_key)) nmi <= 1;
 
@@ -767,6 +795,14 @@ always @(posedge clk32) begin
 				end
 			end
 	endcase
+	end
+
+	if (ss_en) begin
+		{saved_d6, rom_kbb, romL_we, romH_we, reu_map, old_nmiack} <= ss_d[103:98];
+		{old_freeze, nmi, mask_lo, init_n, geo_bank, game_overide, ezrom_en, exrom_overide, count_ena, count,
+		 clock_port, cart_disable, bank_no, bank_lo, bank_hi, allow_freeze, allow_bank, IOF_wr_ena, IOF_ena,
+		 IOF_bank, IOE_wr_ena, IOE_ena, IOE_bank} <= ss_d[95:0];
+	end
 end
 
 wire [19:0] ezrom_addr;
@@ -780,6 +816,7 @@ ez_rom ez_rom
 (
 	.clk(clk32),
 	.reset_n(reset_n & ezrom_en),
+	.pause(pause),
 	.ce(mem_ce & (romH|romL)),
 	.we(mem_write),
 	.addr({romH, bank_no, addr_in[12:0]}),
@@ -793,7 +830,13 @@ ez_rom ez_rom
 	.mem_in(mem_in),
 	.mem_out(ezmem_out),
 	.mem_ce(ezrom_ce),
-	.mem_we(ezrom_we)
+	.mem_we(ezrom_we),
+
+	.ss_en(ss_en),
+	.ss_hold(ss_hold),
+	.ss_load_done(ss_load_done),
+	.ss_si(ss_si),
+	.ss_so(ss_ez_so)
 );
 
 wire [21:0] ezmem_addr = {2'b10, ezrom_addr[19] ? hibanks[ezrom_addr[18:13]] : lobanks[ezrom_addr[18:13]], ezrom_addr[12:0]};

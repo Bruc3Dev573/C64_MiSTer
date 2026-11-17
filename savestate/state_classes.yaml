@@ -1,0 +1,1004 @@
+# State classification for the B7 coverage lint (lint/state_inventory.py).
+#
+# Every flip-flop and inferred memory of the design must match one rule; the
+# first matching rule wins. Paths are "<instance path>.<variable>", with the
+# top instance called "emu" (VHDL process variables appear as "<proc>/<var>",
+# same-named block variables of one module as "<var>#2", "<var>#3" in source
+# order). In 'match', '*' is any text (dots included), '?' one character and
+# brackets are literal: generate scopes are written as in the path (drives[0]).
+#
+#   arch     saved in the scan chain       -> needs segment (from map.yaml)
+#   region   memory saved as a slot region -> needs segment = region name
+#   rebuilt  not saved, rebuilt on load    -> needs reason
+#   ignored  not machine state             -> needs reason
+#
+# A1 (inventory, docs/A1_INVENTORY.md) filled this file from the report of
+# the full design; the human review of each chip PR reads only the 'rebuilt'
+# reasons. Rule of thumb used: when in doubt it is arch.
+#
+# Two kinds of 'rebuilt' recur and rely on engine preconditions listed in
+# docs/A1_INVENTORY.md:
+#   - block RAM port registers (address/data/write-enable/q of the RAM
+#     models): inside the M10K in hardware, rewritten every clock from the
+#     port inputs, which are saved state; they settle in 2 clocks after load
+#     while the machine is still paused (P1, P2);
+#   - DDR3/SD transfer engines: the freeze waits until no burst is in flight
+#     (P3), so the transfer registers hold only leftovers that are rewritten
+#     at the start of the next transfer.
+
+# ============================================================== ROMs, tables
+
+- match: "emu.fpga64.buslogic.chargen*.ram"
+  class: ignored
+  reason: character ROM, loaded from the core, not machine state
+- match: "emu.fpga64.buslogic.kernel_c64gs.ram"
+  class: ignored
+  reason: C64GS KERNAL ROM, read-only
+- match: "emu.fpga64.buslogic.kernel_c64jap.ram"
+  class: ignored
+  reason: Japanese KERNAL ROM, read-only
+- match: "emu.fpga64.buslogic.kernel_c64std.ram"
+  class: ignored
+  reason: standard KERNAL ROM, read-only
+- match: "emu.fpga64.buslogic.kernel_c64.ram"
+  class: ignored
+  reason: loadable KERNAL ROM; the loaded image is part of the config, not of the slot (checked through build hash / config)
+- match: "emu.fpga64.buslogic.*.q0"
+  class: rebuilt
+  reason: registered ROM output (dprom q0), rewritten every clock from the ROM at the saved bus address; read one clock later
+- match: "emu.iec_drive.c1541.genblk1.rom.ram"
+  class: ignored
+  reason: 1541 drive ROM (loadable DOS/DolphinDOS image), content comes from the core or the host ROM file, read-only for the machine
+- match: "emu.iec_drive.c1541.romstd.ram"
+  class: ignored
+  reason: standard 1541 DOS ROM, read-only
+- match: "emu.iec_drive.c1581.genblk1.rom.ram"
+  class: ignored
+  reason: 1581 drive ROM (loadable image), read-only for the machine
+- match: "emu.iec_drive.c1581.romstd.ram"
+  class: ignored
+  reason: standard 1581 DOS ROM, read-only
+- match: "emu.iec_drive.c15?1.genblk1.rom.*"
+  class: rebuilt
+  reason: block RAM port register of the drive ROM (address/we/q), rewritten every clock from the port inputs (host ROM loader on port a, saved mem_a on port b), settles in 2 clocks while paused
+- match: "emu.iec_drive.c15?1.romstd.*"
+  class: rebuilt
+  reason: block RAM port register of the drive ROM (address/we/q), rewritten every clock from the port inputs (host ROM loader on port a, saved mem_a on port b), settles in 2 clocks while paused
+- match: "emu.iec_drive.c1541.rom_??k_i"
+  class: ignored
+  reason: size of the drive ROM image written by the host ROM loader (rom_wr); describes the loaded ROM file, which is configuration like the ROM itself
+- match: "emu.iec_drive.c1541.rom_sz"
+  class: rebuilt
+  reason: rewritten every clock from rom_32k_i/rom_16k_i (ROM image size, configuration)
+- match: "emu.fpga64.sid.sid_tables.f6581_curve"
+  class: ignored
+  reason: 6581 filter cutoff curve, initialized from the core and optionally replaced by the host filter file (ld_wr); configuration like a ROM, never written by the machine
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_direct_gcr.rec"
+  class: rebuilt
+  reason: constant reciprocal table (1<<26)/(i+6000) set by its initializer; the only write (reset) stores the same constant in rec[0]
+
+# ============================================================== Memories saved as regions
+
+- match: "emu.fpga64.colorram.ram"
+  class: region
+  segment: COLORRAM
+- match: "emu.fpga64.colorram.q"
+  class: rebuilt
+  reason: block RAM read register of the Color RAM, rewritten every clock from the RAM at the saved bus address
+- match: "emu.iec_drive.c1541.drives[0].c1541_drv.c1541_logic.ram.ram"
+  class: region
+  segment: RAM_DRV8
+- match: "emu.iec_drive.c1541.drives[1].c1541_drv.c1541_logic.ram.ram"
+  class: region
+  segment: RAM_DRV9
+- match: "emu.iec_drive.c1541.drives[0].c1541_drv.c1541_logic.extram.ram"
+  class: region
+  segment: EXTRAM_DRV8
+- match: "emu.iec_drive.c1541.drives[1].c1541_drv.c1541_logic.extram.ram"
+  class: region
+  segment: EXTRAM_DRV9
+- match: "emu.iec_drive.c1541.drives[0].c1541_drv.c1541_direct_gcr.buffer.rams[?].bitmem.ram"
+  class: region
+  segment: TRACK_DRV8
+- match: "emu.iec_drive.c1541.drives[1].c1541_drv.c1541_direct_gcr.buffer.rams[?].bitmem.ram"
+  class: region
+  segment: TRACK_DRV9
+- match: "emu.iec_drive.c1581.drives[0].c1581_drv.ram.ram"
+  class: region
+  segment: RAM_1581_8
+- match: "emu.iec_drive.c1581.drives[1].c1581_drv.ram.ram"
+  class: region
+  segment: RAM_1581_9
+- match: "emu.iec_drive.c1581.drives[0].c1581_drv.fdc.fifo.ram"
+  class: region
+  segment: FDC_BUF_8
+- match: "emu.iec_drive.c1581.drives[1].c1581_drv.fdc.fifo.ram"
+  class: region
+  segment: FDC_BUF_9
+- match: "emu.opl_inst.shadow"
+  class: region
+  segment: OPL3_REGS
+# block RAM port registers of the region memories (see header)
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_logic.ram.*"
+  class: rebuilt
+  reason: block RAM port register of the 1541 RAM (address/we/q), rewritten every clock from the saved CPU bus (port a writes, port b reads); settles in 2 clocks while paused
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_logic.extram.*"
+  class: rebuilt
+  reason: block RAM port register of the 1541 RAM expansion (address/we/q), rewritten every clock from the saved CPU bus; settles in 2 clocks while paused
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_direct_gcr.buffer.rams[?].bitmem.*"
+  class: rebuilt
+  reason: block RAM port register of the GCR track buffer (port a from the DDR3 DMA, port b from the saved head position buff_addr/buff_we/ht), rewritten every clock from those inputs
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_direct_gcr.buffer.b_sel_d*"
+  class: rebuilt
+  reason: 2-stage delay of buff_addr[5:3] selecting the head bit of the track buffer, rewritten every clock from the saved buff_addr
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.ram.*"
+  class: rebuilt
+  reason: block RAM port register of the 1581 RAM (address/we/q), rewritten every clock from the saved CPU bus; settles in 2 clocks while paused
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.fdc.fifo.q_?"
+  class: rebuilt
+  reason: block RAM read register of the WD1772 sector buffer, rewritten every clock from the saved fifo pointers
+- match: "emu.opl_inst.shadow_q"
+  class: rebuilt
+  reason: block RAM read register of the OPL3 register shadow, rewritten every clock from the region address (engine) or the replay step
+- match: "emu.opl_inst.fmreg_q"
+  class: rebuilt
+  reason: block RAM read register of fmreg, rewritten every clock from the replay step
+- match: "emu.tape.tap_time_map.rd_data"
+  class: rebuilt
+  reason: block RAM read register of the tape time map, rewritten every clock from tap_map_rdaddr; read only when tap_map_update_d, two clocks after the address is set
+
+# ============================================================== Framework outside the machine
+
+- match: "emu.hps_io.*"
+  class: ignored
+  reason: HPS interface (OSD status, ioctl, sd buffers); host side, not machine state
+- match: "emu.video_mixer.*"
+  class: ignored
+  reason: video output path after the VIC, recomputed every frame
+- match: "emu.video_freak.*"
+  class: ignored
+  reason: aspect/crop scaler settings, derived from OSD options
+- match: "emu.drv_ovl.*"
+  class: ignored
+  reason: drive debug/activity overlay, recomputed every frame
+- match: "emu.sync.*"
+  class: ignored
+  reason: video_sync, output sync/blank generator after the VIC (free-runs while paused); the machine reads only resume_ok, which times the pause release; while stopped its target position comes from the VIC raster (vic_x/vic_y), so after a load the machine resumes where the output reaches the loaded VIC, within a frame
+- match: "emu.pause_fb.*"
+  class: ignored
+  reason: pause frame buffer for the analog output (last frame replayed while stopped); display only, refilled by the next frame
+- match: "emu.pause_rel"
+  class: ignored
+  reason: pause release latch (waits for video_sync resume_ok); cleared while a savestate operation holds the machine
+- match: "emu.pause_wd"
+  class: ignored
+  reason: watchdog of the pause release; cleared while a savestate operation holds the machine
+- match: "emu.sdram.*"
+  class: ignored
+  reason: SDRAM controller in clk64 (and the sim memory model), idle at the freeze boundary; the machine areas of the SDRAM (RAM, GeoRAM, REU) are saved as regions, the media areas (CRT, TAP) are open questions in docs/A1_INVENTORY.md
+
+# ============================================================== c64.sv (top level)
+
+# PLL reconfiguration for PAL/NTSC (CLK_50M)
+- match: "emu.cfg_*"
+  class: ignored
+  reason: PLL reconfiguration write sequence for the PAL/NTSC switch (CLK_50M); host clocking, ntsc is in config_mask
+- match: "emu.ntsc_r"
+  class: ignored
+  reason: PAL/NTSC option in the CLK_50M domain (PLL reconfiguration); configuration, compared through config_mask
+- match: "emu.ntscd*"
+  class: ignored
+  reason: synchroniser of the PAL/NTSC option into CLK_50M (PLL reconfiguration)
+- match: "emu.state"
+  class: ignored
+  reason: PLL reconfiguration sequencer (CLK_50M)
+- match: "emu.delay"
+  class: ignored
+  reason: PLL reconfiguration/OSD close delay for the PAL/NTSC switch (CLK_50M)
+- match: "emu.osd_s?"
+  class: ignored
+  reason: synchroniser of OSD_STATUS for the PAL/NTSC switch (CLK_50M)
+- match: "emu.close_osd"
+  class: ignored
+  reason: OSD close pulse to the HPS during a PAL/NTSC switch
+- match: "emu.ntsc_sys1"
+  class: ignored
+  reason: synchroniser of the PAL/NTSC option into clk_sys; configuration (config_mask ntsc)
+- match: "emu.ntsc"
+  class: ignored
+  reason: synchronised PAL/NTSC option; configuration (config_mask ntsc), follows the live option
+- match: "emu.ntsc_prev"
+  class: ignored
+  reason: edge detector of the PAL/NTSC option (a change resets the machine); must follow the live option, restoring it could only fake a reset
+
+# reset sequencer: constant at every freeze (the freeze needs reset_n, no
+# reset_wait, no download/erase: idle bits 1 and 5), so it is rebuilt (A7)
+- match: "emu.reset_n"
+  class: rebuilt
+  reason: reset sequencer output, 1 at every freeze (idle bit 1 needs reset_n) and kept by the idle sequencer; the same value before the save and after the load
+- match: "emu.reset_counter"
+  class: rebuilt
+  reason: reset sequencer counter, 0 at every freeze (reset_n is !reset_counter, idle bit 1); the same value before the save and after the load
+- match: "emu.reset_wait"
+  class: rebuilt
+  reason: PRG-load reset wait, 0 at every freeze (idle bit 1); the same value before the save and after the load
+- match: "emu.do_erase"
+  class: rebuilt
+  reason: erase-on-reset flag, cleared every clock while the sequencer is idle (no download, no erase, counter 0), so 0 at every freeze
+- match: "emu.old_download"
+  class: ignored
+  reason: edge detector of the host ioctl_download strobe, idle (0) at freeze and load; restoring it could only fake a download start
+- match: "emu.old_download#2"
+  class: ignored
+  reason: edge detector of the host ioctl_download strobe, idle (0) at freeze and load; restoring it could only fake a download end
+
+# host loader / RAM eraser (PRG/CRT/TAP/REU download, memory init, upload)
+- match: "emu.ioctl_*"
+  class: ignored
+  reason: host download/upload engine (ioctl to SDRAM); idle unless the host is loading, and pause is released by any download (precondition P5)
+- match: "emu.inj_*"
+  class: ignored
+  reason: PRG injection (BASIC pointer init) run by the host loader; idle outside downloads (P5)
+- match: "emu.old_meminit"
+  class: ignored
+  reason: edge detector of inj_meminit (host PRG injection), idle outside downloads (P5)
+- match: "emu.rd_cyc"
+  class: ignored
+  reason: read pipeline of the host upload (cartridge save), idle outside uploads (P5)
+- match: "emu.erasing"
+  class: ignored
+  reason: RAM erase after reset/download, driven by the host loader engine (ioctl_load_addr); the engine does not save while erasing (P5)
+- match: "emu.erase_*"
+  class: ignored
+  reason: RAM erase after reset/download, driven by the host loader engine; the engine does not save while erasing (P5)
+- match: "emu.force_erase"
+  class: ignored
+  reason: request of the RAM erase after reset (host loader engine); the engine does not save while erasing (P5)
+- match: "emu.old_st0"
+  class: ignored
+  reason: edge detector of the OSD "Reset & Detach" command (status[17])
+- match: "emu.cart_blk_len"
+  class: ignored
+  reason: CRT file parser of the host loader (CHIP block length), only active during a CRT download
+- match: "emu.cart_hdr_*"
+  class: ignored
+  reason: CRT file parser of the host loader (CHIP header), only active during a CRT download
+- match: "emu.cart_bank_*"
+  class: ignored
+  reason: CRT file parser of the host loader (bank of the current CHIP block), only active during a CRT download
+- match: "emu.cart_id_hi"
+  class: ignored
+  reason: CRT file parser of the host loader (high byte of the type), only active during a CRT download
+- match: "emu.cart_id"
+  class: ignored
+  reason: type of the CRT image attached by the host (from the CRT header); describes the media in SDRAM, which is not in the slot (open question Q2, config_mask)
+- match: "emu.cart_exrom"
+  class: ignored
+  reason: EXROM line from the attached CRT header; describes the media (see cart_id)
+- match: "emu.cart_game"
+  class: ignored
+  reason: GAME line from the attached CRT header; describes the media (see cart_id)
+- match: "emu.cart_attached"
+  class: ignored
+  reason: a CRT image is attached (set by the host CRT download, cleared by Reset & Detach); describes the media (see cart_id)
+- match: "emu.ext_crt"
+  class: ignored
+  reason: the attached cartridge came from a .CRT file (host file type), used only for the EasyFlash write-back to the file
+- match: "emu.ezfl_*"
+  class: ignored
+  reason: EasyFlash write-back of the flash content to the CRT file on the SD (host side)
+- match: "emu.save_old"
+  class: ignored
+  reason: edge detector of the OSD EasyFlash save command
+- match: "emu.ext_old"
+  class: ignored
+  reason: edge detector of ext_crt for the EasyFlash write-back (host side)
+
+# SDRAM slot shared by the tape player and the loader
+- match: "emu.io_cycle*"
+  class: rebuilt
+  reason: SDRAM request of the io_cycle slot (TAP prefetch or host loader), rewritten at the start of every io_cycle from the grid, tap_play_addr (saved in TAPE) and the idle loader; no edge while stopped (sysCycle held); the tape address pending at the freeze is recomputed on ss_load_done from the restored tap_play_addr
+
+# keyboard input path and joystick-to-key macros: host input turned into PS/2
+# key events; D3 releases every key after a load (kbd_reset on ss_load_done),
+# so none of it is saved (A7)
+- match: "emu.key"
+  class: ignored
+  reason: PS/2 key event pipe from the host into the keyboard matrix; its strobe bit (key[10]) must follow the live host strobe ps2_key[10], restoring it would replay or drop a key event
+- match: "emu.joy_key"
+  class: rebuilt
+  reason: combinational decode of the joystick buttons, assigned with '=' at the top of the clocked block every clock before use
+- match: "emu.joy_last"
+  class: ignored
+  reason: joystick-to-key macro (host input typed as PS/2 events); D3, keys are released after a load
+- match: "emu.joy_finish"
+  class: ignored
+  reason: joystick-to-key macro (host input typed as PS/2 events); D3, keys are released after a load
+- match: "emu.act"
+  class: ignored
+  reason: joystick-to-key macro (host input typed as PS/2 events); D3, keys are released after a load
+- match: "emu.to"
+  class: ignored
+  reason: joystick-to-key macro autorepeat delay (host input typed as PS/2 events); D3, keys are released after a load
+- match: "emu.start_strk"
+  class: ignored
+  reason: one-clock pulse at the end of the host RAM injection (PRG loader), idle outside downloads
+- match: "emu.reset_keys"
+  class: ignored
+  reason: one-clock key matrix clear from the joystick-to-key macro (host input); D3
+
+# drives: clock enable, activity, mounts
+- match: "emu.drive_ce"
+  class: rebuilt
+  reason: drive clock enable pulse from drive_sum (saved); 0 whenever the machine is stopped, so it never shifts (a bit passing through it would clock the drives)
+- match: "emu.drv_pause"
+  class: rebuilt
+  reason: c64_pause delayed by one clock (the stop of the drives), the hold of the disk activity detector; constant 1 while frozen
+- match: "emu.drive_sum"
+  class: arch
+  segment: TOP
+- match: "emu.drive_msum"
+  class: rebuilt
+  reason: rewritten every clock from ntsc (constant per standard, configuration)
+- match: "emu.nsum"
+  class: rebuilt
+  reason: assigned with '=' every clock from drive_sum (saved) before use
+- match: "emu.drive_mounted"
+  class: ignored
+  reason: host image mount status (img_size at each mount); describes the mounted media, not the slot
+- match: "emu.old_img_mounted"
+  class: ignored
+  reason: edge detector of the host img_mounted strobe (write-protect override at mount)
+- match: "emu.disk_access"
+  class: arch
+  segment: TOP
+- match: "emu.disk_access_to"
+  class: arch
+  segment: TOP
+- match: "emu.c64_iec_clk_old"
+  class: arch
+  segment: TOP
+- match: "emu.drive_iec_clk_old"
+  class: arch
+  segment: TOP
+- match: "emu.drive_stb_?_old"
+  class: arch
+  segment: TOP
+
+# video output, pause framework, debug overlay
+- match: "emu.hq2x160"
+  class: ignored
+  reason: scaler option latched at vsync (video output)
+- match: "emu.old_vsync"
+  class: ignored
+  reason: vsync edge detector for the scaler option (video output)
+- match: "emu.ce_pix"
+  class: ignored
+  reason: pixel clock enable of the scaler (CLK_VIDEO, video output)
+- match: "emu.div"
+  class: ignored
+  reason: pixel clock divider of the scaler (CLK_VIDEO, video output)
+- match: "emu.lores"
+  class: ignored
+  reason: pixel clock divider of the scaler (CLK_VIDEO, video output)
+- match: "emu.vcrop"
+  class: ignored
+  reason: crop setting from HDMI resolution and OSD (video output)
+- match: "emu.wide"
+  class: ignored
+  reason: crop setting from HDMI resolution and OSD (video output)
+- match: "emu.ovl_color"
+  class: ignored
+  reason: overlay colour register (video output)
+- match: "emu.freeze"
+  class: ignored
+  reason: OSD pause / HDMI freeze request (framework)
+- match: "emu.old_sync"
+  class: ignored
+  reason: edge detector of freeze_sync from the scaler (framework)
+- match: "emu.dbg_*"
+  class: ignored
+  reason: DDR3 snoop for the drive debug overlay (debug)
+- match: "emu.old_rd"
+  class: ignored
+  reason: DDR3 read edge detector for the debug overlay (debug)
+- match: "emu.old_we"
+  class: ignored
+  reason: DDR3 write edge detector for the debug overlay (debug)
+- match: "emu.old_ps2_stb"
+  class: ignored
+  reason: cursor-key control of the debug overlay base address (debug)
+- match: "emu.repeat_*"
+  class: ignored
+  reason: cursor-key autorepeat of the debug overlay (debug)
+- match: "emu.dir_*"
+  class: ignored
+  reason: cursor-key direction of the debug overlay (debug)
+- match: "emu.ce_sys_div"
+  class: ignored
+  reason: free-running pixel enable of the drive and tape overlays (video output)
+
+# expansion port and audio
+- match: "emu.ext_cycle_d"
+  class: rebuilt
+  reason: one-clock delay of ext_cycle (machine grid), constant while stopped
+- match: "emu.old_ioe"
+  class: rebuilt
+  reason: IOE strobe edge detector, follows IOE every clock; IOE is 0 while stopped (chip selects gated by cpuHasBus)
+- match: "emu.old_iof"
+  class: rebuilt
+  reason: IOF strobe edge detector, follows IOF every clock; IOF is 0 while stopped (chip selects gated by cpuHasBus)
+- match: "emu.ioe_we"
+  class: rebuilt
+  reason: one-clock IOE write pulse for the DigiMax, 0 while stopped (IOE is 0)
+- match: "emu.iof_we"
+  class: rebuilt
+  reason: one-clock IOF write pulse for the DigiMax, 0 while stopped (IOF is 0)
+- match: "emu.sid_ld_*"
+  class: ignored
+  reason: host loader of the SID filter curve file (ioctl), configuration
+- match: "emu.digimax_dac"
+  class: arch
+  segment: CART
+- match: "emu.digimax_act"
+  class: arch
+  segment: CART
+- match: "emu.dac_?"
+  class: rebuilt
+  reason: DigiMax output mix, rewritten every clock from digimax_dac[] and digimax_act (saved); read only by the audio mixer
+- match: "emu.opl_s"
+  class: ignored
+  reason: OPL output sample for the audio mix, taken once per running C64 cycle (holds while stopped); after a load the OPL output itself comes from the replay (A9)
+- match: "emu.cin"
+  class: ignored
+  reason: audio output mix/compressor after the chips (recomputed every clock)
+- match: "emu.cout"
+  class: ignored
+  reason: audio output mix/compressor after the chips (recomputed every clock)
+- match: "emu.al?"
+  class: ignored
+  reason: audio output mix after the chips (recomputed every clock)
+- match: "emu.ar?"
+  class: ignored
+  reason: audio output mix after the chips (recomputed every clock)
+
+# tape, user port, RTC enable
+- match: "emu.use_tape"
+  class: rebuilt
+  reason: tape/RTC select of the cassette sense line and RTC reset, read on every clock; never shifts, written back from its copy ss_use_tape (saved) on ss_load_done
+- match: "emu.ss_use_tape"
+  class: arch
+  segment: TAPE
+- match: "emu.use_tape_to"
+  class: arch
+  segment: TAPE
+- match: "emu.act_cnt"
+  class: ignored
+  reason: blink counter of the tape LED (USER LED output)
+- match: "emu.rxd?"
+  class: ignored
+  reason: synchroniser of the external UART/USER_IN line (real-time link, see docs/PAUSE.md); follows the live pin
+- match: "emu.dsr?"
+  class: ignored
+  reason: synchroniser of the external UART DSR line; follows the live pin
+- match: "emu.cts?"
+  class: ignored
+  reason: synchroniser of the external UART CTS line; follows the live pin
+- match: "emu.uart_*"
+  class: ignored
+  reason: debounced external UART line; follows the live pin within 3 clocks
+- match: "emu.use_rtc"
+  class: rebuilt
+  reason: RTC enable on the cassette read line, read on every clock; never shifts, written back from its copy ss_use_rtc (saved) on ss_load_done
+- match: "emu.ss_use_rtc"
+  class: arch
+  segment: RTC
+- match: "emu.use_rtc_to"
+  class: arch
+  segment: RTC
+
+# ============================================================== fpga64_sid_iec glue (bus timing, TOD, banking)
+#
+# A savestate stops and releases the machine on one point of the 32-clock bus
+# cycle grid only: the pause input is sampled at preCycle = pred(CYCLE_EXT4)
+# with rfsh_cycle = 0, sysCycle then stays CYCLE_EXT4 until the release on the
+# same sample (ss_freeze, docs/SAVESTATES.md). The grid registers below hold
+# the same value at every such point, so the live value at a load is the one
+# of the save. They are also the freeze itself and the enables of the chips:
+# shifting them would run the machine or the SDRAM refresh during a save.
+
+- match: "emu.fpga64.precycle"
+  class: rebuilt
+  reason: free-running position in the 32-clock C64 cycle; never stops (SDRAM refresh), the freeze releases the machine on the same position it stopped on
+- match: "emu.fpga64.rfsh_cycle"
+  class: rebuilt
+  reason: counts C64 cycles only while sysEnable is 1; the freeze is sampled with rfsh_cycle = 0 and it stays 0 until the release
+- match: "emu.fpga64.sysenable"
+  class: rebuilt
+  reason: the freeze itself (0 from the stop to the release sample, which sets it from the pause input); owned by ss_freeze
+- match: "emu.fpga64.refresh"
+  class: rebuilt
+  reason: one-clock pulse at preCycle = pred(CYCLE_EXT4) with rfsh_cycle = 0, rewritten every clock from preCycle/rfsh_cycle; keeps pulsing for the SDRAM while frozen
+- match: "emu.fpga64.reset"
+  class: rebuilt
+  reason: not reset_n, sampled at the end of each C64 cycle; 0 at a savestate boundary (idle bit 1 requires reset_n with no reset pending, idle bit 0 requires the CPU out of reset)
+- match: "emu.fpga64.enable*"
+  class: rebuilt
+  reason: one-clock chip enables decoded from sysCycle (enableVic at VIC2/CPUE, enableCia_n/p, enableSid, enablePixel, enableCpu two clocks after a CPU access at CPU0-CPUC); all 0 with sysCycle held at CYCLE_EXT4
+- match: "emu.fpga64.pulsewr_io"
+  class: rebuilt
+  reason: one-clock I/O write strobe at CYCLE_CPUC, rewritten every clock; 0 with sysCycle held at CYCLE_EXT4
+- match: "emu.fpga64.cpu_cyc_s"
+  class: rebuilt
+  reason: two-clock delay of the CPU access decode (CPU0-CPUC), rewritten every clock; 00 from CYCLE_EXT0 on, so 00 at CYCLE_EXT4
+- match: "emu.fpga64.io_enable"
+  class: rebuilt
+  reason: set at CYCLE_EXT0, cleared after the CYCLE_CPUC access (enableCpu); always 1 at CYCLE_EXT4
+- match: "emu.fpga64.phi0_cpu"
+  class: rebuilt
+  reason: CPU half of the cycle, set at pred(CYCLE_CPU0), cleared at CYCLE_CPUF; always 0 at CYCLE_EXT4
+- match: "emu.fpga64.cpuhasbus"
+  class: rebuilt
+  reason: set at pred(CYCLE_CPU0) for a CPU access, cleared at CYCLE_CPUF; always 0 at CYCLE_EXT4 (it also gates every chip select decoded from the CPU address while the chain shifts)
+- match: "emu.fpga64.todclk"
+  class: rebuilt
+  reason: the CIAs sample their TOD input on every clock, so todclk never shifts; written back from ss_todclk (saved) on ss_load_done and held while frozen
+- match: "emu.fpga64.ss_todclk"
+  class: arch
+  segment: SYS
+- match: "emu.fpga64.tod_sum"
+  class: arch
+  segment: SYS
+- match: "emu.fpga64.dma_active"
+  class: arch
+  segment: SYS
+- match: "emu.fpga64.lastvicdi"
+  class: arch
+  segment: SYS
+- match: "emu.fpga64.turbo_*"
+  class: arch
+  segment: SYS
+- match: "emu.fpga64.vicaddr1514"
+  class: arch
+  segment: SYS
+- match: "emu.fpga64.vicbus"
+  class: arch
+  segment: SYS
+# cia2_pai[7:6] (IEC CLK/DATA input latch)
+- match: "emu.fpga64.cia2_pai_iec"
+  class: arch
+  segment: SYS
+- match: "emu.fpga64.buslogic.c64*_ena"
+  class: arch
+  segment: SYS
+
+# ============================================================== CPU 6510
+
+- match: "emu.fpga64.cpu.currentio"
+  class: rebuilt
+  reason: rewritten every clock from ioData/ioDir and the port pins (held while the engine owns the machine), drives the cassette lines and the banking, so it never shifts; written back from ss_currentio (saved, keeps the input bits that hold their level) on ss_load_done
+- match: "emu.fpga64.cpu.cpu.res_n_?"
+  class: rebuilt
+  reason: T65 reset synchroniser, the asynchronous reset of every T65 register (never shifts); 1 at an instruction boundary (Sync needs the T65 out of reset, idle bit 1 no reset pending)
+- match: "emu.fpga64.cpu.*"
+  class: arch
+  segment: CPU
+
+# ============================================================== VIC-II
+
+- match: "emu.fpga64.vic.vblanking"
+  class: rebuilt
+  reason: vBlanking, rewritten every clock as (rasterY = rasterBlank) from the saved rasterY; only drives the vSync output
+- match: "emu.fpga64.vic.*"
+  class: arch
+  segment: VIC
+
+# ============================================================== CIAs
+
+- match: "emu.fpga64.cia?.pa_out"
+  class: rebuilt
+  reason: drives the keyboard matrix (CIA1), the VIC bank and the IEC bus (CIA2) on every clock, so it never shifts; written back from ss_pa_out (saved) on ss_load_done, changes only on phi2 otherwise
+- match: "emu.fpga64.cia?.pb_out"
+  class: rebuilt
+  reason: drives the keyboard matrix (CIA1) and the parallel cable/user port (CIA2) on every clock, so it never shifts; written back from ss_pb_out (saved) on ss_load_done
+- match: "emu.fpga64.cia?.pc_n"
+  class: rebuilt
+  reason: PC2 strobe of the parallel cable (drive_stb_i) and the user port, sampled by the drives on every clock, so it never shifts; written back from ss_pc_n (saved) on ss_load_done
+- match: "emu.fpga64.cia?.old_flag"
+  class: rebuilt
+  reason: edge detector of the live FLAG pin (cassette read, user port, parallel cable strobe); follows the pin on every clock, also while the engine owns the machine, when it latches no edge (a load presents the loaded drive outputs before the release); a pending edge is kept in 'flag' (saved)
+- match: "emu.fpga64.cia1.*"
+  class: arch
+  segment: CIA1
+- match: "emu.fpga64.cia2.*"
+  class: arch
+  segment: CIA2
+
+# ============================================================== SID (sid_top holds both chips)
+
+- match: "emu.fpga64.sid.sid_tables.f0*"
+  class: rebuilt
+  reason: registered filter-curve lookup, rewritten every clock from Filter_Fc/Fc_offset (saved) of the SID selected by state[3]; sid_filter samples F0 several clocks after state moves
+- match: "emu.fpga64.sid.sid_tables.*_out"
+  class: rebuilt
+  reason: registered combined-waveform table output, rewritten every clock from f_acc_t (saved); sid_top samples it two clocks after setting f_acc_t (states 3-13)
+# output samples: they are on the chain (SID1) because the audio mix leaves
+# the core on every clock and a SID cycle may be cut by the freeze
+- match: "emu.fpga64.sid.audio"
+  class: arch
+  segment: SID1
+- match: "emu.fpga64.sid.audio0"
+  class: arch
+  segment: SID1
+- match: "emu.fpga64.sid.chip[?].v?.norm_dac"
+  class: rebuilt
+  reason: waveform DAC output, rewritten every clock from the saved oscillator/waveform state and control register; dac_out samples it only at ce_1m
+# register files and waveform outputs of both chips: element [0] (voices 0-2
+# for the *_out arrays) belongs to SID1, element [1] (voices 3-5) to SID2
+- match: "emu.fpga64.sid.Voice_*"
+  class: arch
+  segment: [SID1, SID2]
+- match: "emu.fpga64.sid.Filter_*"
+  class: arch
+  segment: [SID1, SID2]
+- match: "emu.fpga64.sid.Fc_offset"
+  class: rebuilt
+  reason: copy of the OSD filter offset (fc_offset_l/r), rewritten every clock from the host port
+- match: "emu.fpga64.sid.bus_data"
+  class: arch
+  segment: [SID1, SID2]
+- match: "emu.fpga64.sid._st_out"
+  class: arch
+  segment: [SID1, SID2]
+- match: "emu.fpga64.sid.p_t_out"
+  class: arch
+  segment: [SID1, SID2]
+- match: "emu.fpga64.sid.ps__out"
+  class: arch
+  segment: [SID1, SID2]
+- match: "emu.fpga64.sid.pst_out"
+  class: arch
+  segment: [SID1, SID2]
+- match: "emu.fpga64.sid.chip[1].*"
+  class: arch
+  segment: SID2
+- match: "emu.fpga64.sid.*"
+  class: arch
+  segment: SID1
+
+# ============================================================== keyboard (matrix and hotkeys), mouse
+
+- match: "emu.fpga64.keyboard.ps2_stb"
+  class: ignored
+  reason: toggle-edge detector of the PS/2 strobe (emu.key[10], from the host); must follow the live strobe, restoring it would replay the last key event
+- match: "emu.fpga64.keyboard.pa?"
+  class: rebuilt
+  reason: keyboard matrix output to CIA1 port A, rewritten every clock from CIA1 port B output, key matrix (saved) and joysticks (live host input)
+- match: "emu.fpga64.keyboard.pb?"
+  class: rebuilt
+  reason: keyboard matrix output to CIA1 port B, rewritten every clock from CIA1 port A output, key matrix (saved) and joysticks (live host input)
+- match: "emu.fpga64.keyboard.tape_*"
+  class: rebuilt
+  reason: one-clock datassette hotkey pulse, cleared every clock and set only by a new PS/2 event
+- match: "emu.fpga64.keyboard.*"
+  class: ignored
+  reason: PS/2 key matrix, modifier keys and the shifted-key delay, host keyboard input; D3, cleared by kbd_reset on ss_load_done, so the C64 never sees a key from the save or the load
+- match: "emu.mouse.old_status"
+  class: ignored
+  reason: toggle-edge detector of the host mouse strobe ps2_mouse[24]; must follow the live strobe, restoring it would replay the last movement
+- match: "emu.mouse.*"
+  class: arch
+  segment: INPUT
+
+# ============================================================== REU
+
+- match: "emu.reu.addr_mask"
+  class: rebuilt
+  reason: assigned with '=' every clock from cfg (REU size option, configuration) before use
+- match: "emu.reu.error"
+  class: rebuilt
+  reason: assigned with '=' every clock from op_act and data[] (saved) before use (verify mismatch)
+- match: "emu.reu.dma_*"
+  class: rebuilt
+  reason: REU output to the C64 bus (DMA request, address, data, write), read on every clock outside the REU; never shifts, written back from its copy ss_dma_* (saved) on ss_load_done
+- match: "emu.reu.ram_*"
+  class: rebuilt
+  reason: REU output to the SDRAM port (address, data, write), read on every clock outside the REU; never shifts, written back from its copy ss_ram_* (saved) on ss_load_done
+- match: "emu.reu.irq"
+  class: rebuilt
+  reason: REU IRQ line to the CPU, read on every clock outside the REU; never shifts, written back from its copy ss_irq (saved) on ss_load_done
+- match: "emu.reu.cpu_din"
+  class: rebuilt
+  reason: REU register read data on the IO bus, read on every clock outside the REU; never shifts, written back from its copy ss_cpu_din (saved) on ss_load_done
+- match: "emu.reu.*"
+  class: arch
+  segment: REU
+
+# ============================================================== cartridge
+
+- match: "emu.cartridge.lobanks*"
+  class: ignored
+  reason: bank table of the CRT image in SDRAM, written only by the host CRT loader (cart_bank_wr during a download); describes the attached media like the image itself, which is not in the slot
+- match: "emu.cartridge.hibanks*"
+  class: ignored
+  reason: bank table of the CRT image in SDRAM, written only by the host CRT loader (cart_bank_wr during a download); describes the attached media
+- match: "emu.cartridge.bank_cnt"
+  class: ignored
+  reason: number of CHIP blocks of the attached CRT, counted by the host CRT loader; describes the media
+- match: "emu.cartridge.old_loading"
+  class: ignored
+  reason: edge detector of the host CRT download
+- match: "emu.cartridge.ez_rom.rom?.mem_req"
+  class: rebuilt
+  reason: flash SDRAM request into the arbitration of c64.sv, read on every clock outside the cartridge; never shifts, written back from its copy ss_mem_req (saved) on ss_load_done
+- match: "emu.cartridge.old_id"
+  class: ignored
+  reason: copy of cart_id (media type, see emu.cart_id) from the previous clock; follows the live value
+- match: "emu.cartridge.*"
+  class: arch
+  segment: CART
+
+# ============================================================== datassette
+
+- match: "emu.tape.tap_scanner.*"
+  class: ignored
+  reason: scanner of the TAP image in SDRAM run after each download (builds the time map); describes the host media, which is not in the slot
+- match: "emu.tape.tap_time_map.ram"
+  class: ignored
+  reason: TAP time map (file offset per counter unit) built by tap_scanner from the TAP image; describes the host media, never written by the machine
+- match: "emu.tape.tap_version"
+  class: ignored
+  reason: TAP format version from the file header, latched during the download; describes the host media
+- match: "emu.tape.old_tap_download"
+  class: ignored
+  reason: edge detector of the host TAP download
+- match: "emu.tape.cmd_*_d"
+  class: ignored
+  reason: edge detector of a tape command from the OSD or the keyboard hotkeys (host UI); idle at freeze
+- match: "emu.tape.tape_counter.counter_reset_d"
+  class: ignored
+  reason: edge detector of the OSD/hotkey counter reset command (host UI)
+- match: "emu.tape.tape_counter.x_pos"
+  class: ignored
+  reason: tape counter overlay raster position (video output)
+- match: "emu.tape.tape_counter.y_pos"
+  class: ignored
+  reason: tape counter overlay raster position (video output)
+- match: "emu.tape.tape_counter.old_hblank"
+  class: ignored
+  reason: tape counter overlay raster position (video output)
+- match: "emu.tape.tape_counter.tc_*_r"
+  class: ignored
+  reason: tape counter overlay pixel pipeline (video output)
+- match: "emu.tape.tape_counter.font_*"
+  class: ignored
+  reason: tape counter overlay pixel pipeline (video output)
+- match: "emu.tape.tape_counter.p?_s?"
+  class: ignored
+  reason: tape counter overlay pixel pipeline (video output)
+- match: "emu.tape.tape_counter.valid_s?"
+  class: ignored
+  reason: tape counter overlay pixel pipeline (video output)
+- match: "emu.tape.tape_counter.color_s?"
+  class: ignored
+  reason: tape counter overlay pixel pipeline (video output)
+- match: "emu.tape.tape_counter.pixel_color"
+  class: ignored
+  reason: tape counter overlay pixel output (video output)
+- match: "emu.tape.*"
+  class: arch
+  segment: TAPE
+
+# ============================================================== RTC (PCF8583 on the cassette port)
+
+- match: "emu.rtcF83.flg"
+  class: rebuilt
+  reason: edge detector of the host RTC toggle (RTC[64], time sent by Main at core load); follows the live toggle while running, so a host update made while stopped lands at the resume; restoring it would replay the host time over the saved one
+- match: "emu.rtcF83.sda_o"
+  class: rebuilt
+  reason: I2C data out on the cassette read line, read on every clock; never shifts, written back from its copy ss_sda_o (saved) on ss_load_done
+- match: "emu.rtcF83.*"
+  class: arch
+  segment: RTC
+
+# ============================================================== OPL3 (SFX Sound Expander)
+
+- match: "emu.opl_inst.fmreg"
+  class: rebuilt
+  reason: register values the FM part has or will take from its queue (it is not saved and runs on across a load); follows the C64 writes like the shadow, and after a load the replay queues every register where the loaded shadow differs and copies it here
+- match: "emu.opl_inst.clr"
+  class: rebuilt
+  reason: walks the register shadow and fmreg to zero while the OPL is in reset (the firmware zeroes every register there); runs only while rst_n is low and one pass after it, and there is no save or load during a C64 reset; with the Sound Expander off the region is not in the slot
+- match: "emu.opl_inst.rp"
+  class: rebuilt
+  reason: replay step after a load (the registers that differ between the loaded shadow and fmreg queued as register writes, then the saved index); 0 at every save, because a load holds the machine and the next operation until it ends (ss_replay)
+- match: "emu.opl_inst.ss_rgn_ack"
+  class: rebuilt
+  reason: one-clock acknowledge of an engine region access, idle between accesses
+- match: "emu.opl_inst.opl3.*"
+  class: rebuilt
+  reason: FM part in clk_opl (Z80 firmware, its RAM, register queue, sample sequencer, pause synchronizer). Not saved and not reset by a load; the replay queues every register whose loaded value differs, so the FM registers come back while envelopes, phases and LFOs go on from the state before the load (A9, docs/SAVESTATES.md); not serialized, decision D9 (the C64 reads none of it)
+- match: "emu.opl_inst.*"
+  class: arch
+  segment: OPL3
+
+# ============================================================== 1541 units (drives[0] = unit 8, drives[1] = unit 9)
+
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.old_mounted"
+  class: ignored
+  reason: edge detector of the host img_mounted strobe (mount sequence start); idle at freeze and load
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.dirty_sync.*"
+  class: ignored
+  reason: synchroniser of busy_flushing (SD write-back pending), drives only out_we, the write LED of the overlay
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.change_sync.*"
+  class: ignored
+  reason: synchroniser of the host img_mounted strobe (new image - reload and forget dirty tracks); idle at freeze and load
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.old_change"
+  class: ignored
+  reason: edge detector of the host img_mounted strobe; idle at freeze and load
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.bg_*"
+  class: ignored
+  reason: background write-back of dirty DDR3 image tracks to the SD file (host-side image persistence); describes the live DDR3 image, which is not in the slot
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.dirty_tracks"
+  class: ignored
+  reason: tracks of the live DDR3 image not yet written to the SD file (host-side image persistence); restoring it would mark the wrong tracks of the live image
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.scan_track"
+  class: ignored
+  reason: round-robin pointer of the SD write-back scan (host-side image persistence)
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.sd_*"
+  class: ignored
+  reason: SD write-back handshake to the HPS (host side); no SD transfer in flight at the freeze boundary (P3)
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.lba"
+  class: ignored
+  reason: SD block address of the write-back (host side)
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.old_ack"
+  class: ignored
+  reason: edge detector of the host sd_ack (write-back done); idle at freeze and load
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.dma_*"
+  class: rebuilt
+  reason: DDR3<->track buffer DMA transfer registers; the freeze boundary (idle bit 3, c1541_track ss_idle) has no foreground transfer running or about to start, and every one of them is set again at the start of the next transfer (IDLE dispatch, START_DMA, PREP_DDRAM_WRITE, READ_BUFF) before it is read; a background SD flush fetch may be in flight and keeps its live value (host side)
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.ddr_offset_q"
+  class: rebuilt
+  reason: DDR3 address of the current DMA transfer; set in the IDLE dispatch / START_DMA / PREP_DDRAM_WRITE before any DDR3 request (P3)
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_track.reset_sync.*"
+  class: rebuilt
+  reason: synchroniser of the unit reset (host/OSD level, released while the engine owns the machine); follows the live level, so a load never resets the host side of the track cache (SD write-back queue)
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_direct_gcr.buff_we"
+  class: rebuilt
+  reason: head write pulse into the track buffer, set on a drive clock enable and cleared on the next clock; 0 whenever the machine is stopped, so it never shifts (a bit passing through would write the track buffer)
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_logic.cpu.res_n_?"
+  class: rebuilt
+  reason: reset synchroniser of the drive T65 (asynchronous reset of its registers, never shifts); the unit reset is released while the engine owns the machine, so it is 1 two clocks later, long before the chain moves
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.c1541_logic.uc?.phi2_ref"
+  class: ignored
+  reason: phi2_ref output of the VIA, not connected in the 1541
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.disk_ready"
+  class: rebuilt
+  reason: rewritten every clock from the mount sequence (state, phase_timer, saved); only gates the keyboard and lights the LED during a disk change, held at the c1541_multi output while the engine owns the machine
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.readonly"
+  class: ignored
+  reason: write protect of the mounted image (host, latched at its mount); the saved mount sequence reads it, so a load keeps the image that is mounted
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.present"
+  class: ignored
+  reason: an image is mounted (host, latched at its mount); the saved mount sequence reads it, so a load keeps the image that is mounted
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.mount_id"
+  class: ignored
+  reason: identity of the mounted image (free-running count sampled at its mount, host side); a load compares it with the saved copy ss_mount_id and, when they differ, drops the saved track write-back and reloads the track from the mounted image
+- match: "emu.iec_drive.c1541.drives[?].c1541_drv.ss_rgn_*"
+  class: ignored
+  reason: savestate region port of the unit (RAM, EXTRAM, TRACK); runs the save/load, not machine state
+- match: "emu.iec_drive.c1541.drives[0].*"
+  class: arch
+  segment: DRV8_1541
+- match: "emu.iec_drive.c1541.drives[1].*"
+  class: arch
+  segment: DRV9_1541
+
+# ============================================================== 1581 units (drives[0] = unit 8, drives[1] = unit 9)
+
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.prev_mounted"
+  class: ignored
+  reason: edge detector of the host img_mounted strobe (write-protect latch at mount); idle at freeze and load
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.wps_n"
+  class: ignored
+  reason: write protect of the mounted image (host, latched at its mount); a load keeps the image that is mounted
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.fdc.img_mountedD"
+  class: ignored
+  reason: edge detector of the host img_mounted strobe (disk geometry at mount); idle at freeze and load
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.fdc.fdn_*"
+  class: ignored
+  reason: geometry and presence of the mounted image (computed from img_size at mount); describes the host media, not the slot
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.fdc.i"
+  class: rebuilt
+  reason: for-loop index over the floppy units, not storage
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.cpu.res_n_?"
+  class: rebuilt
+  reason: reset synchroniser of the drive T65 (asynchronous reset of its registers, never shifts); the unit reset is released while the engine owns the machine, so it is 1 two clocks later, long before the chain moves
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.via.phi2_ref"
+  class: ignored
+  reason: phi2_ref output of the VIA, not connected in the 1581
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.cia.pc*"
+  class: ignored
+  reason: PC handshake output of the 8520 (pc_n) and its strobe (pcr), not connected in the 1581
+- match: "emu.iec_drive.c1581.drives[?].c1581_drv.ss_rgn_*"
+  class: ignored
+  reason: savestate region port of the unit (RAM, FDC_BUF); runs the save/load, not machine state
+- match: "emu.iec_drive.c1581.drives[0].*"
+  class: arch
+  segment: DRV8_1581
+- match: "emu.iec_drive.c1581.drives[1].*"
+  class: arch
+  segment: DRV9_1581
+
+# ============================================================== IEC drives: shared glue
+
+- match: "emu.iec_drive.dtype"
+  class: ignored
+  reason: drive type per unit (1541/1581) set by the host at image mount; configuration, compared through config_mask (drive8_type/drive9_type)
+- match: "emu.iec_drive.i"
+  class: rebuilt
+  reason: for-loop index of the dtype update, not storage
+- match: "emu.iec_drive.c1541.arb_*"
+  class: ignored
+  reason: DDR3 port arbiter between the drives (host memory interface, like the SDRAM controller); idle at the freeze boundary (P3)
+- match: "emu.iec_drive.c1541.burst_remaining"
+  class: ignored
+  reason: DDR3 port arbiter burst counter (host memory interface); idle at the freeze boundary (P3)
+- match: "emu.iec_drive.c1541.stop_r"
+  class: rebuilt
+  reason: c64_pause delayed by one clock (the clocks where drive_ce is 0 and the C64 holds from EXT5), the hold of the every-clock logic of the drives; constant 1 while frozen
+- match: "emu.iec_drive.c1541.rst_sync.*"
+  class: rebuilt
+  reason: synchroniser of the drive reset (host/OSD level, drive enable at mount), follows it; the units see it released while the engine owns the machine
+- match: "emu.iec_drive.c1541.out_h"
+  class: rebuilt
+  reason: holds the drive outputs (IEC, parallel cable, LEDs, disk_ready) while the engine owns the machine and follows them otherwise, so the outputs never move while the chain shifts
+- match: "emu.iec_drive.c1541.mnt_*"
+  class: ignored
+  reason: host mount strobe made into a pulse for the units (edge, image size, write protect), held while the engine owns the machine; idle at freeze and load
+- match: "emu.iec_drive.c1541.mount_seed"
+  class: ignored
+  reason: free-running count that gives each mount an identity (host side, compared by the units on load)
+- match: "emu.iec_drive.c1541.*"
+  class: arch
+  segment: DRV8_1541
+  # shared by both 1541 units (ph2 divider, ROM fetch, IEC synchronizers); owned by unit 8
+- match: "emu.iec_drive.c1581.stop_r"
+  class: rebuilt
+  reason: c64_pause delayed by one and two clocks (the stop of the 1581 units, and their hold for the engine one clock later); constant 1 while frozen
+- match: "emu.iec_drive.c1581.rst_sync.*"
+  class: rebuilt
+  reason: synchroniser of the 1581 reset (host/OSD level, drive type at mount), follows it; the units see it released while the engine owns the machine
+- match: "emu.iec_drive.c1581.out_h"
+  class: rebuilt
+  reason: holds the 1581 outputs (IEC, parallel cable, LEDs) while the engine owns the machine and follows them otherwise, so the outputs never move while the chain shifts; takes the loaded outputs on ss_load_done
+- match: "emu.iec_drive.c1581.mnt_*"
+  class: ignored
+  reason: host mount strobe made into a pulse for the units (edge, image size, write protect), held while the engine owns the machine; idle at freeze and load
+- match: "emu.iec_drive.c1581.state"
+  class: rebuilt
+  reason: step of the ROM fetch of the 1581 CPUs; while the drives are stopped the fetch repeats, so every byte is fetched again from the held CPU addresses before the drives run
+- match: "emu.iec_drive.c1581.mem_a"
+  class: rebuilt
+  reason: ROM address of the fetch, rewritten from the CPU addresses (saved) by the fetch that repeats while the drives are stopped
+- match: "emu.iec_drive.c1581.drv_data"
+  class: rebuilt
+  reason: ROM bytes at the CPU addresses, fetched again while the drives are stopped (a stop lasts a whole C64 cycle or more, and a load ends long after the chain moved), so they are those of the loaded addresses before a CPU reads them
+- match: "emu.iec_drive.c1581.*"
+  class: arch
+  segment: DRV8_1581
+  # shared by both 1581 units (ph2 divider, IEC synchronizers, ph2 pulses); owned by unit 8
+
+# ============================================================== savestate engine (A2)
+# The engine, its request queue, UI and the SDRAM/DDR3/Color RAM ports run
+# the save/load itself: they are not machine state and must keep their live
+# value across a load (restoring them would restart or abort the operation).
+- match: "emu.ss_*"
+  class: ignored
+  reason: savestate engine, statemanager, UI, freeze controller and memory ports (A2); run the save/load, not machine state
+# Hotkey strobe parity (c64.sv): tracks the host PS/2 strobe so eaten
+# Ctrl+Alt+F1..F4 events never reach the C64; restoring an old value would
+# inject or drop one key event.
+- match: "emu.kbd_par"
+  class: ignored
+  reason: host keyboard strobe bookkeeping (savestate hotkeys), follows the live host strobe

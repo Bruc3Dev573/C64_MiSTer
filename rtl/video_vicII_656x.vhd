@@ -66,12 +66,24 @@ entity video_vicii_656x is
 		hSync : out std_logic;
 		vSync : out std_logic;
 		colorIndex : out unsigned(3 downto 0);
+		-- raster position for the output sync of the core (c64.sv video_sync):
+		-- X, and the raster line with the delayed step of the last line to
+		-- line 0 already applied
+		rasterXpos : out unsigned(9 downto 0);
+		rasterYpos : out unsigned(8 downto 0);
 
 		-- Debug outputs
 		debugX  : out unsigned(9 downto 0);
 		debugY  : out unsigned(8 downto 0);
 		vicRefresh : out std_logic;
-		addrValid : out std_logic
+		addrValid : out std_logic;
+
+		-- savestate scan chain, segment VIC (WP A5, docs/SAVESTATES.md):
+		-- ss_en shifts, ss_hold freezes every process that runs on each clock
+		ss_en    : in  std_logic := '0';
+		ss_hold  : in  std_logic := '0';
+		ss_si    : in  std_logic := '0';
+		ss_so    : out std_logic
 	);
 end entity;
 
@@ -98,7 +110,10 @@ architecture rtl of video_vicii_656x is
 
 -- State machine
 	signal lastLineFlag : boolean; -- True for on last line of the frame.
-	signal vicCycle : vicCycles := cycleRefresh1;
+	-- vicCycle is stored as a vector ('pos of the enum): a chain cell must hold
+	-- any bit pattern while the chain shifts
+	signal vicCycle_v : std_logic_vector(3 downto 0) := "0000";
+	signal vicCycle : vicCycles;
 	signal sprite : unsigned(2 downto 0) := "000";
 	signal shiftChars : boolean;
 	signal shiftLoadEna : boolean;
@@ -271,6 +286,152 @@ architecture rtl of video_vicii_656x is
 	
 	signal turbo_reg : std_logic;
 
+	-- registers behind the output ports (read back for the savestate chain)
+	signal do_r : unsigned(7 downto 0);
+	signal colorIndex_r : unsigned(3 downto 0);
+	signal vicRefresh_r : std_logic;
+	signal MShift_r : MFlags;   -- the sprite shift flags, kept in a variable inside the process
+
+-- Savestate chain: segment vector (bit 0 leaves first), field offsets in
+-- savestate/map.yaml order
+	constant O_WE_R : natural := 0;
+	constant O_RD_R : natural := 1;
+	constant O_ADDR_R : natural := 2;
+	constant O_DI_R : natural := 8;
+	constant O_BACNT : natural := 16;
+	constant O_LASTLINEFLAG : natural := 19;
+	constant O_VICCYCLE : natural := 20;
+	constant O_SPRITE : natural := 24;
+	constant O_VICADDRREG : natural := 27;
+	constant O_NEXTCHAR : natural := 41;
+	constant O_CHARSTORE : natural := 53;
+	constant O_MPTR : natural := 521;
+	constant O_VICREFRESH : natural := 529;
+	constant O_REFRESHCOUNTER : natural := 530;
+	constant O_RASTERENABLE : natural := 538;
+	constant O_BACHARS : natural := 539;
+	constant O_BASPRITE04 : natural := 540;
+	constant O_BASPRITE15 : natural := 541;
+	constant O_BASPRITE26 : natural := 542;
+	constant O_BASPRITE37 : natural := 543;
+	constant O_BASPRITELAST : natural := 544;
+	constant O_COLCOUNTER : natural := 545;
+	constant O_ROWCOUNTER : natural := 555;
+	constant O_COLRESTART : natural := 558;
+	constant O_IDLE : natural := 568;
+	constant O_RASTERX : natural := 569;
+	constant O_RASTERXDELAY : natural := 579;
+	constant O_CYCLELASTDELAY : natural := 589;
+	constant O_RASTERY : natural := 590;
+	constant O_RASTERIRQDONE : natural := 599;
+	constant O_IRST : natural := 600;
+	constant O_ILP : natural := 601;
+	constant O_LIGHTPENHIT : natural := 602;
+	constant O_LPX : natural := 603;
+	constant O_LPY : natural := 611;
+	constant O_HBLACK : natural := 619;
+	constant O_HBLANKING : natural := 620;
+	constant O_MAINBORDER : natural := 621;
+	constant O_TBBORDER : natural := 622;
+	constant O_SETTBBORDER : natural := 623;
+	constant O_SHIFTING_FF : natural := 624;
+	constant O_WAITINGCHAR_R : natural := 625;
+	constant O_WAITINGPIXELS_R : natural := 637;
+	constant O_SHIFTINGCHAR : natural := 645;
+	constant O_SHIFTINGPIXELS : natural := 657;
+	constant O_CURRENTPIXELS : natural := 665;
+	constant O_PIXELBGFLAG : natural := 667;
+	constant O_CURRENTPIXELS_D : natural := 668;
+	constant O_SHIFTINGCHAR_D : natural := 670;
+	constant O_MCMDELAY : natural := 682;
+	constant O_ECMDELAY : natural := 683;
+	constant O_BMMDELAY : natural := 684;
+	constant O_WAITINGPIXELS : natural := 685;
+	constant O_WAITINGCHAR : natural := 693;
+	constant O_MCBASE : natural := 705;
+	constant O_MDMA : natural := 753;
+	constant O_MYE_FF : natural := 761;
+	constant O_MCNT : natural := 769;
+	constant O_MACTIVE : natural := 817;
+	constant O_MSHIFT : natural := 825;
+	constant O_MSHIFT_STOP : natural := 833;
+	constant O_MXE_FF : natural := 841;
+	constant O_MC_FF : natural := 849;
+	constant O_MCURRENTPIXEL_R : natural := 857;
+	constant O_MPIXELS : natural := 873;
+	constant O_MCURRENTPIXEL : natural := 1065;
+	constant O_MC : natural := 1081;
+	constant O_MCCOLORDELAY : natural := 1089;
+	constant O_MCCOLOR : natural := 1097;
+	constant O_MPIXELSTORE : natural := 1105;
+	constant O_COLORINDEX : natural := 1121;
+	constant O_M2MCLR : natural := 1125;
+	constant O_IMMC : natural := 1126;
+	constant O_COLLISION : natural := 1127;
+	constant O_M2M : natural := 1135;
+	constant O_M2MHIT : natural := 1143;
+	constant O_IMBC : natural := 1144;
+	constant O_M2DDELAY : natural := 1145;
+	constant O_M2D : natural := 1153;
+	constant O_M2DHIT : natural := 1161;
+	constant O_RESETLIGHTPENIRQ : natural := 1162;
+	constant O_RESETIMMC : natural := 1163;
+	constant O_RESETIMBC : natural := 1164;
+	constant O_RESETRASTERIRQ : natural := 1165;
+	constant O_MX : natural := 1166;
+	constant O_RASTERCMP : natural := 1238;
+	constant O_ECM : natural := 1247;
+	constant O_BMM : natural := 1248;
+	constant O_DEN : natural := 1249;
+	constant O_RSEL : natural := 1250;
+	constant O_YSCROLL : natural := 1251;
+	constant O_ME : natural := 1254;
+	constant O_RES : natural := 1262;
+	constant O_MCM : natural := 1263;
+	constant O_CSEL : natural := 1264;
+	constant O_XSCROLL : natural := 1265;
+	constant O_MYE : natural := 1268;
+	constant O_VM : natural := 1276;
+	constant O_CB : natural := 1280;
+	constant O_ELP : natural := 1283;
+	constant O_EMMC : natural := 1284;
+	constant O_EMBC : natural := 1285;
+	constant O_ERST : natural := 1286;
+	constant O_MPRIO : natural := 1287;
+	constant O_MCDELAY : natural := 1295;
+	constant O_MXE : natural := 1303;
+	constant O_EC : natural := 1311;
+	constant O_B0C : natural := 1315;
+	constant O_B1C : natural := 1319;
+	constant O_B2C : natural := 1323;
+	constant O_B3C : natural := 1327;
+	constant O_MM0 : natural := 1331;
+	constant O_MM1 : natural := 1335;
+	constant O_SPRITECOLORS : natural := 1339;
+	constant O_TURBO_REG : natural := 1371;
+	constant O_MY : natural := 1372;
+	constant O_DO : natural := 1436;
+	constant SS_BITS : natural := 1444;
+
+	signal ss_q, ss_d : std_logic_vector(SS_BITS-1 downto 0);
+
+	function b2s(b : boolean) return std_logic is
+	begin
+		if b then return '1'; else return '0'; end if;
+	end function;
+	function vcv(c : vicCycles) return std_logic_vector is
+	begin
+		return std_logic_vector(to_unsigned(vicCycles'pos(c), 4));
+	end function;
+	-- the two unused patterns only appear while the chain shifts (machine stopped)
+	function vcd(v : std_logic_vector(3 downto 0)) return vicCycles is
+		variable i : natural range 0 to 15;
+	begin
+		i := to_integer(unsigned(v));
+		if i > vicCycles'pos(vicCycles'high) then i := 0; end if;
+		return vicCycles'val(i);
+	end function;
+
 begin
 -- -----------------------------------------------------------------------
 -- Ouput signals
@@ -279,8 +440,142 @@ begin
 	vicAddr <= vicAddrReg when registeredAddress else vicAddrLoc;
 	hSync <= hBlanking;
 	vSync <= vBlanking;
+	rasterXpos <= rasterX;
+	rasterYpos <= (others => '0') when cycleLastDelay else rasterY;
 	irq_n <= not IRQ;
 	turbo_state <= turbo_reg;
+	do <= do_r;
+	colorIndex <= colorIndex_r;
+	vicRefresh <= vicRefresh_r;
+	vicCycle <= vcd(vicCycle_v);
+
+-- -----------------------------------------------------------------------
+-- Savestate chain: pack the registers (unpacked in the process of each)
+-- -----------------------------------------------------------------------
+	ss_q(O_WE_R) <= we_r;
+	ss_q(O_RD_R) <= rd_r;
+	ss_q(O_ADDR_R+5 downto O_ADDR_R) <= std_logic_vector(addr_r);
+	ss_q(O_DI_R+7 downto O_DI_R) <= std_logic_vector(di_r);
+	ss_q(O_BACNT+2 downto O_BACNT) <= std_logic_vector(baCnt);
+	ss_q(O_LASTLINEFLAG) <= b2s(lastLineFlag);
+	ss_q(O_VICCYCLE+3 downto O_VICCYCLE) <= vicCycle_v;
+	ss_q(O_SPRITE+2 downto O_SPRITE) <= std_logic_vector(sprite);
+	ss_q(O_VICADDRREG+13 downto O_VICADDRREG) <= std_logic_vector(vicAddrReg);
+	ss_q(O_NEXTCHAR+11 downto O_NEXTCHAR) <= std_logic_vector(nextChar);
+	g_cs: for i in 0 to 38 generate
+		ss_q(O_CHARSTORE+12*i+11 downto O_CHARSTORE+12*i) <= std_logic_vector(charStore(i));
+	end generate;
+	ss_q(O_MPTR+7 downto O_MPTR) <= std_logic_vector(MPtr);
+	ss_q(O_VICREFRESH) <= vicRefresh_r;
+	ss_q(O_REFRESHCOUNTER+7 downto O_REFRESHCOUNTER) <= std_logic_vector(refreshCounter);
+	ss_q(O_RASTERENABLE) <= rasterEnable;
+	ss_q(O_BACHARS) <= baChars;
+	ss_q(O_BASPRITE04) <= baSprite04;
+	ss_q(O_BASPRITE15) <= baSprite15;
+	ss_q(O_BASPRITE26) <= baSprite26;
+	ss_q(O_BASPRITE37) <= baSprite37;
+	ss_q(O_BASPRITELAST) <= baSpriteLast;
+	ss_q(O_COLCOUNTER+9 downto O_COLCOUNTER) <= std_logic_vector(colCounter);
+	ss_q(O_ROWCOUNTER+2 downto O_ROWCOUNTER) <= std_logic_vector(rowCounter);
+	ss_q(O_COLRESTART+9 downto O_COLRESTART) <= std_logic_vector(colRestart);
+	ss_q(O_IDLE) <= idle;
+	ss_q(O_RASTERX+9 downto O_RASTERX) <= std_logic_vector(rasterX);
+	ss_q(O_RASTERXDELAY+9 downto O_RASTERXDELAY) <= std_logic_vector(rasterXDelay);
+	ss_q(O_CYCLELASTDELAY) <= b2s(cycleLastDelay);
+	ss_q(O_RASTERY+8 downto O_RASTERY) <= std_logic_vector(rasterY);
+	ss_q(O_RASTERIRQDONE) <= rasterIrqDone;
+	ss_q(O_IRST) <= IRST;
+	ss_q(O_ILP) <= ILP;
+	ss_q(O_LIGHTPENHIT) <= lightPenHit;
+	ss_q(O_LPX+7 downto O_LPX) <= std_logic_vector(lpX);
+	ss_q(O_LPY+7 downto O_LPY) <= std_logic_vector(lpY);
+	ss_q(O_HBLACK) <= hBlack;
+	ss_q(O_HBLANKING) <= hBlanking;
+	ss_q(O_MAINBORDER) <= MainBorder;
+	ss_q(O_TBBORDER) <= TBBorder;
+	ss_q(O_SETTBBORDER) <= b2s(setTBBorder);
+	ss_q(O_SHIFTING_FF) <= shifting_ff;
+	ss_q(O_WAITINGCHAR_R+11 downto O_WAITINGCHAR_R) <= std_logic_vector(waitingChar_r);
+	ss_q(O_WAITINGPIXELS_R+7 downto O_WAITINGPIXELS_R) <= std_logic_vector(waitingPixels_r);
+	ss_q(O_SHIFTINGCHAR+11 downto O_SHIFTINGCHAR) <= std_logic_vector(shiftingChar);
+	ss_q(O_SHIFTINGPIXELS+7 downto O_SHIFTINGPIXELS) <= std_logic_vector(shiftingPixels);
+	ss_q(O_CURRENTPIXELS+1 downto O_CURRENTPIXELS) <= std_logic_vector(currentPixels);
+	ss_q(O_PIXELBGFLAG) <= pixelBgFlag;
+	ss_q(O_CURRENTPIXELS_D+1 downto O_CURRENTPIXELS_D) <= std_logic_vector(currentPixels_d);
+	ss_q(O_SHIFTINGCHAR_D+11 downto O_SHIFTINGCHAR_D) <= std_logic_vector(shiftingChar_d);
+	ss_q(O_MCMDELAY) <= MCMDelay;
+	ss_q(O_ECMDELAY) <= ECMDelay;
+	ss_q(O_BMMDELAY) <= BMMDelay;
+	ss_q(O_WAITINGPIXELS+7 downto O_WAITINGPIXELS) <= std_logic_vector(waitingPixels);
+	ss_q(O_WAITINGCHAR+11 downto O_WAITINGCHAR) <= std_logic_vector(waitingChar);
+	g_spr: for i in 0 to 7 generate
+		ss_q(O_MCBASE+6*i+5 downto O_MCBASE+6*i) <= std_logic_vector(MCBase(i));
+		ss_q(O_MDMA+i) <= b2s(MDMA(i));
+		ss_q(O_MCNT+6*i+5 downto O_MCNT+6*i) <= std_logic_vector(MCnt(i));
+		ss_q(O_MACTIVE+i) <= b2s(MActive(i));
+		ss_q(O_MSHIFT+i) <= b2s(MShift_r(i));
+		ss_q(O_MSHIFT_STOP+i) <= b2s(MShift_stop(i));
+		ss_q(O_MCURRENTPIXEL_R+2*i+1 downto O_MCURRENTPIXEL_R+2*i) <= std_logic_vector(MCurrentPixel_r(i));
+		ss_q(O_MPIXELS+24*i+23 downto O_MPIXELS+24*i) <= std_logic_vector(MPixels(i));
+		ss_q(O_MCURRENTPIXEL+2*i+1 downto O_MCURRENTPIXEL+2*i) <= std_logic_vector(MCurrentPixel(i));
+		ss_q(O_MX+9*i+8 downto O_MX+9*i) <= std_logic_vector(MX(i));
+		ss_q(O_MY+8*i+7 downto O_MY+8*i) <= std_logic_vector(MY(i));
+		ss_q(O_SPRITECOLORS+4*i+3 downto O_SPRITECOLORS+4*i) <= std_logic_vector(spriteColors(i));
+	end generate;
+	ss_q(O_MYE_FF+7 downto O_MYE_FF) <= std_logic_vector(MYE_ff);
+	ss_q(O_MXE_FF+7 downto O_MXE_FF) <= std_logic_vector(MXE_ff);
+	ss_q(O_MC_FF+7 downto O_MC_FF) <= std_logic_vector(MC_ff);
+	ss_q(O_MC+7 downto O_MC) <= std_logic_vector(MC);
+	ss_q(O_MCCOLORDELAY+7 downto O_MCCOLORDELAY) <= std_logic_vector(MCColorDelay);
+	ss_q(O_MCCOLOR+7 downto O_MCCOLOR) <= std_logic_vector(MCColor);
+	ss_q(O_MPIXELSTORE+15 downto O_MPIXELSTORE) <= std_logic_vector(MPixelStore);
+	ss_q(O_COLORINDEX+3 downto O_COLORINDEX) <= std_logic_vector(colorIndex_r);
+	ss_q(O_M2MCLR) <= M2MClr;
+	ss_q(O_IMMC) <= IMMC;
+	ss_q(O_COLLISION+7 downto O_COLLISION) <= std_logic_vector(collision);
+	ss_q(O_M2M+7 downto O_M2M) <= std_logic_vector(M2M);
+	ss_q(O_M2MHIT) <= M2Mhit;
+	ss_q(O_IMBC) <= IMBC;
+	ss_q(O_M2DDELAY+7 downto O_M2DDELAY) <= std_logic_vector(M2DDelay);
+	ss_q(O_M2D+7 downto O_M2D) <= std_logic_vector(M2D);
+	ss_q(O_M2DHIT) <= M2Dhit;
+	ss_q(O_RESETLIGHTPENIRQ) <= resetLightPenIrq;
+	ss_q(O_RESETIMMC) <= resetIMMC;
+	ss_q(O_RESETIMBC) <= resetIMBC;
+	ss_q(O_RESETRASTERIRQ) <= resetRasterIrq;
+	ss_q(O_RASTERCMP+8 downto O_RASTERCMP) <= std_logic_vector(rasterCmp);
+	ss_q(O_ECM) <= ECM;
+	ss_q(O_BMM) <= BMM;
+	ss_q(O_DEN) <= DEN;
+	ss_q(O_RSEL) <= RSEL;
+	ss_q(O_YSCROLL+2 downto O_YSCROLL) <= std_logic_vector(yscroll);
+	ss_q(O_ME+7 downto O_ME) <= std_logic_vector(ME);
+	ss_q(O_RES) <= RES;
+	ss_q(O_MCM) <= MCM;
+	ss_q(O_CSEL) <= CSEL;
+	ss_q(O_XSCROLL+2 downto O_XSCROLL) <= std_logic_vector(xscroll);
+	ss_q(O_MYE+7 downto O_MYE) <= std_logic_vector(MYE);
+	ss_q(O_VM+3 downto O_VM) <= std_logic_vector(VM);
+	ss_q(O_CB+2 downto O_CB) <= std_logic_vector(CB);
+	ss_q(O_ELP) <= ELP;
+	ss_q(O_EMMC) <= EMMC;
+	ss_q(O_EMBC) <= EMBC;
+	ss_q(O_ERST) <= ERST;
+	ss_q(O_MPRIO+7 downto O_MPRIO) <= std_logic_vector(MPRIO);
+	ss_q(O_MCDELAY+7 downto O_MCDELAY) <= std_logic_vector(MCDelay);
+	ss_q(O_MXE+7 downto O_MXE) <= std_logic_vector(MXE);
+	ss_q(O_EC+3 downto O_EC) <= std_logic_vector(EC);
+	ss_q(O_B0C+3 downto O_B0C) <= std_logic_vector(B0C);
+	ss_q(O_B1C+3 downto O_B1C) <= std_logic_vector(B1C);
+	ss_q(O_B2C+3 downto O_B2C) <= std_logic_vector(B2C);
+	ss_q(O_B3C+3 downto O_B3C) <= std_logic_vector(B3C);
+	ss_q(O_MM0+3 downto O_MM0) <= std_logic_vector(MM0);
+	ss_q(O_MM1+3 downto O_MM1) <= std_logic_vector(MM1);
+	ss_q(O_TURBO_REG) <= turbo_reg;
+	ss_q(O_DO+7 downto O_DO) <= std_logic_vector(do_r);
+
+	ss_d  <= ss_si & ss_q(SS_BITS-1 downto 1);
+	ss_so <= ss_q(0);
 
 -- -----------------------------------------------------------------------
 -- chip-select signals and data/address bus latch
@@ -293,6 +588,12 @@ begin
 				rd_r <= cs and not we;
 				addr_r <= aRegisters;
 				di_r <= diRegisters;
+			end if;
+			if ss_en = '1' then
+				we_r <= ss_d(O_WE_R);
+				rd_r <= ss_d(O_RD_R);
+				addr_r <= unsigned(ss_d(O_ADDR_R+5 downto O_ADDR_R));
+				di_r <= unsigned(ss_d(O_DI_R+7 downto O_DI_R));
 			end if;
 		end if;
 	end process;
@@ -328,14 +629,19 @@ begin
 	process(clk)
 	begin
 		if rising_edge(clk) then
-			if baLoc = '0' then
-				if phi = '0'
-				and enaData = '1'
-				and baCnt(2) = '0' then
-					baCnt <= baCnt + 1;
+			if ss_hold = '0' then
+				if baLoc = '0' then
+					if phi = '0'
+					and enaData = '1'
+					and baCnt(2) = '0' then
+						baCnt <= baCnt + 1;
+					end if;
+				else
+					baCnt <= (others => '0');
 				end if;
-			else
-				baCnt <= (others => '0');
+			end if;
+			if ss_en = '1' then
+				baCnt <= unsigned(ss_d(O_BACNT+2 downto O_BACNT));
 			end if;
 		end if;
 	end process;
@@ -347,17 +653,22 @@ begin
 		variable rasterLines : integer range 0 to 312;
 	begin
 		if rising_edge(clk) then
-			lastLineFlag <= false;
+			if ss_hold = '0' then
+				lastLineFlag <= false;
 
-			rasterLines := 311; -- PAL
-			if mode6567old = '1' then
-				rasterLines := 261; -- NTSC (R7 and earlier have 262 lines)
+				rasterLines := 311; -- PAL
+				if mode6567old = '1' then
+					rasterLines := 261; -- NTSC (R7 and earlier have 262 lines)
+				end if;
+				if mode6567R8 = '1' then
+					rasterLines := 262; -- NTSC (R8 and newer have 263 lines)
+				end if;
+				if rasterY = rasterLines then
+					lastLineFlag <= true;
+				end if;
 			end if;
-			if mode6567R8 = '1' then
-				rasterLines := 262; -- NTSC (R8 and newer have 263 lines)
-			end if;
-			if rasterY = rasterLines then
-				lastLineFlag <= true;
+			if ss_en = '1' then
+				lastLineFlag <= ss_d(O_LASTLINEFLAG) = '1';
 			end if;
 		end if;
 	end process;
@@ -372,47 +683,50 @@ vicStateMachine: process(clk)
 			and baSync = '0' then
 				if phi = '0' then
 					case vicCycle is
-					when cycleRefresh1 => vicCycle <= cycleRefresh2;
-					when cycleRefresh2 => vicCycle <= cycleRefresh3;
-					when cycleRefresh3 => vicCycle <= cycleRefresh4;  -- X=0..7 on this cycle
-					when cycleRefresh4 => vicCycle <= cycleRefresh5;
-					when cycleRefresh5 => vicCycle <= cycleChar;
+					when cycleRefresh1 => vicCycle_v <= vcv(cycleRefresh2);
+					when cycleRefresh2 => vicCycle_v <= vcv(cycleRefresh3);
+					when cycleRefresh3 => vicCycle_v <= vcv(cycleRefresh4);  -- X=0..7 on this cycle
+					when cycleRefresh4 => vicCycle_v <= vcv(cycleRefresh5);
+					when cycleRefresh5 => vicCycle_v <= vcv(cycleChar);
 					when cycleChar =>
 						if rasterX(9 downto 3) = "0101000" then
 							if mode6569 = '1' or mode6572 = '1' then -- PAL/PAL-N
-							vicCycle <= cycleCalcSprites;
+							vicCycle_v <= vcv(cycleCalcSprites);
 						end if;
 							if mode6567R8  = '1' or mode6567old = '1' then -- New/Old NTSC
-								vicCycle <= cycleIdle1;
+								vicCycle_v <= vcv(cycleIdle1);
 							end if;
 						end if;
 					when cycleIdle1 =>
 						if mode6567R8  = '1' then
-							vicCycle <= cycleIdle2; -- New NTSC - 2 extra idle cycles (65 cycles/line)
+							vicCycle_v <= vcv(cycleIdle2); -- New NTSC - 2 extra idle cycles (65 cycles/line)
 						else
-							vicCycle <= cycleCalcSprites; -- Old NTSC - 1 extra idle cycle (64 cycles/line)
+							vicCycle_v <= vcv(cycleCalcSprites); -- Old NTSC - 1 extra idle cycle (64 cycles/line)
 						end if;
-					when cycleIdle2 => vicCycle <= cycleCalcSprites;
-					when cycleCalcSprites => vicCycle <= cycleSpriteBa1;
-					when cycleSpriteBa1   => vicCycle <= cycleSpriteBa2;
-					when cycleSpriteBa2   => vicCycle <= cycleSpriteBa3;
+					when cycleIdle2 => vicCycle_v <= vcv(cycleCalcSprites);
+					when cycleCalcSprites => vicCycle_v <= vcv(cycleSpriteBa1);
+					when cycleSpriteBa1   => vicCycle_v <= vcv(cycleSpriteBa2);
+					when cycleSpriteBa2   => vicCycle_v <= vcv(cycleSpriteBa3);
 					when others =>
 						null;
 					end case;
 				else
 					case vicCycle is
-					when cycleSpriteBa3 => vicCycle <= cycleSpriteA;
+					when cycleSpriteBa3 => vicCycle_v <= vcv(cycleSpriteA);
 					when cycleSpriteA =>
-						vicCycle <= cycleSpriteB;
+						vicCycle_v <= vcv(cycleSpriteB);
 					when cycleSpriteB =>
-						vicCycle <= cycleSpriteA;
+						vicCycle_v <= vcv(cycleSpriteA);
 						if sprite = 7 then
-							vicCycle <= cycleRefresh1;
+							vicCycle_v <= vcv(cycleRefresh1);
 						end if;
 					when others =>
 						null;
 					end case;
 				end if;
+			end if;
+			if ss_en = '1' then
+				vicCycle_v <= ss_d(O_VICCYCLE+3 downto O_VICCYCLE);
 			end if;
 		end if;
 	end process;
@@ -430,7 +744,10 @@ vicStateMachine: process(clk)
 			and baSync = '0' then
 				sprite <= sprite + 1;
 			end if;
-		end if;			
+			if ss_en = '1' then
+				sprite <= unsigned(ss_d(O_SPRITE+2 downto O_SPRITE));
+			end if;
+		end if;
 	end process;
 
 -- -----------------------------------------------------------------------
@@ -487,7 +804,12 @@ vicStateMachine: process(clk)
 	process(clk)
 	begin
 		if rising_edge(clk) then
-			vicAddrReg <= vicAddrLoc;
+			if ss_hold = '0' then
+				vicAddrReg <= vicAddrLoc;
+			end if;
+			if ss_en = '1' then
+				vicAddrReg <= unsigned(ss_d(O_VICADDRREG+13 downto O_VICADDRREG));
+			end if;
 		end if;
 	end process;
 
@@ -507,6 +829,12 @@ vicStateMachine: process(clk)
 					nextChar <= charStore(38);
 				end if;
 				charStore <= charStore(37 downto 0) & nextChar;
+			end if;
+			if ss_en = '1' then
+				nextChar <= unsigned(ss_d(O_NEXTCHAR+11 downto O_NEXTCHAR));
+				for i in 0 to 38 loop
+					charStore(i) <= unsigned(ss_d(O_CHARSTORE+12*i+11 downto O_CHARSTORE+12*i));
+				end loop;
 			end if;
 		end if;
 	end process;
@@ -531,6 +859,9 @@ vicStateMachine: process(clk)
 					MPtr <= di;
 				end if;
 			end if;
+			if ss_en = '1' then
+				MPtr <= unsigned(ss_d(O_MPTR+7 downto O_MPTR));
+			end if;
 		end if;
 	end process;
 
@@ -540,20 +871,26 @@ vicStateMachine: process(clk)
 	process(clk)
 	begin
 		if rising_edge(clk) then
-			vicRefresh <= '0';
-			case vicCycle is
-			when cycleRefresh1 | cycleRefresh2 | cycleRefresh3 | cycleRefresh4 | cycleRefresh5 =>
-				vicRefresh <= '1';
-				if phi = '0'
-				and enaData = '1'
-				and baSync = '0' then
-					refreshCounter <= refreshCounter - 1;
+			if ss_hold = '0' then
+				vicRefresh_r <= '0';
+				case vicCycle is
+				when cycleRefresh1 | cycleRefresh2 | cycleRefresh3 | cycleRefresh4 | cycleRefresh5 =>
+					vicRefresh_r <= '1';
+					if phi = '0'
+					and enaData = '1'
+					and baSync = '0' then
+						refreshCounter <= refreshCounter - 1;
+					end if;
+				when others =>
+					null;
+				end case;
+				if lastLineFlag then
+					refreshCounter <= (others => '1');
 				end if;
-			when others =>
-				null;
-			end case;
-			if lastLineFlag then
-				refreshCounter <= (others => '1');
+			end if;
+			if ss_en = '1' then
+				vicRefresh_r <= ss_d(O_VICREFRESH);
+				refreshCounter <= unsigned(ss_d(O_REFRESHCOUNTER+7 downto O_REFRESHCOUNTER));
 			end if;
 		end if;
 	end process;
@@ -567,11 +904,16 @@ vicStateMachine: process(clk)
 		-- This is only possible in line 48 on the VIC-II.
 		-- On other lines any DEN changes are ignored.
 		if rising_edge(clk) then
-			if (rasterY = 48) and (DEN = '1') then
-				rasterEnable <= '1';
+			if ss_hold = '0' then
+				if (rasterY = 48) and (DEN = '1') then
+					rasterEnable <= '1';
+				end if;
+				if (rasterY = 248) then
+					rasterEnable <= '0';
+				end if;
 			end if;
-			if (rasterY = 248) then
-				rasterEnable <= '0';
+			if ss_en = '1' then
+				rasterEnable <= ss_d(O_RASTERENABLE);
 			end if;
 		end if;
 	end process;
@@ -604,7 +946,7 @@ vicStateMachine: process(clk)
 	process(clk)
 	begin
 		if rising_edge(clk) then
-			if phi = '0' then
+			if phi = '0' and ss_hold = '0' then
 				baChars <= '1';
 				case vicCycle is
 				when cycleRefresh2 | cycleRefresh3 | cycleRefresh4 | cycleRefresh5 =>
@@ -618,6 +960,9 @@ vicStateMachine: process(clk)
 					end if;
 				end case;
 			end if;
+			if ss_en = '1' then
+				baChars <= ss_d(O_BACHARS);
+			end if;
 		end if;
 	end process;
 
@@ -627,7 +972,7 @@ vicStateMachine: process(clk)
 	process(clk)
 	begin
 		if rising_edge(clk) then
-			if phi = '0' then
+			if phi = '0' and ss_hold = '0' then
 				if sprite = 1 then
 					baSprite04 <= '1';
 				end if;
@@ -682,6 +1027,13 @@ vicStateMachine: process(clk)
 				if MDMA(7) and (vicCycle = cycleSpriteB) and (sprite = 5) then
 					baSprite37 <= '0';
 				end if;
+			end if;
+			if ss_en = '1' then
+				baSprite04   <= ss_d(O_BASPRITE04);
+				baSprite15   <= ss_d(O_BASPRITE15);
+				baSprite26   <= ss_d(O_BASPRITE26);
+				baSprite37   <= ss_d(O_BASPRITE37);
+				baSpriteLast <= ss_d(O_BASPRITELAST);
 			end if;
 		end if;
 	end process;
@@ -775,6 +1127,12 @@ vicStateMachine: process(clk)
 					idle <= '0';
 				end if;
 			end if;
+			if ss_en = '1' then
+				colCounter <= unsigned(ss_d(O_COLCOUNTER+9 downto O_COLCOUNTER));
+				rowCounter <= unsigned(ss_d(O_ROWCOUNTER+2 downto O_ROWCOUNTER));
+				colRestart <= unsigned(ss_d(O_COLRESTART+9 downto O_COLRESTART));
+				idle       <= ss_d(O_IDLE);
+			end if;
 		end if;
 	end process;
 
@@ -812,6 +1170,12 @@ rasterCounters: process(clk, rasterX, rasterXDelay)
 					rasterY <= rasterY_next;
 				end if;
 			end if;
+			if ss_en = '1' then
+				rasterX        <= unsigned(ss_d(O_RASTERX+9 downto O_RASTERX));
+				rasterXDelay   <= unsigned(ss_d(O_RASTERXDELAY+9 downto O_RASTERXDELAY));
+				cycleLastDelay <= ss_d(O_CYCLELASTDELAY) = '1';
+				rasterY        <= unsigned(ss_d(O_RASTERY+8 downto O_RASTERY));
+			end if;
 		end if;
 	end process;
 
@@ -821,19 +1185,25 @@ rasterCounters: process(clk, rasterX, rasterXDelay)
 	process(clk)
 	begin
 		if rising_edge(clk) then
-			if phi = '1'
-			and enaData = '1'
-			and baSync = '0'
-			and ((lastLineFlag and cycleLastDelay) or (not lastLineFlag and cycleLast)) then
-				rasterIrqDone <= '0';
+			if ss_hold = '0' then
+				if phi = '1'
+				and enaData = '1'
+				and baSync = '0'
+				and ((lastLineFlag and cycleLastDelay) or (not lastLineFlag and cycleLast)) then
+					rasterIrqDone <= '0';
+				end if;
+				if resetRasterIrq = '1' then
+					IRST <= '0';
+				end if;
+				if (rasterIrqDone = '0')
+				and (rasterY = rasterCmp) then
+					rasterIrqDone <= '1';
+					IRST <= '1';
+				end if;
 			end if;
-			if resetRasterIrq = '1' then
-				IRST <= '0';
-			end if;
-			if (rasterIrqDone = '0')
-			and (rasterY = rasterCmp) then
-				rasterIrqDone <= '1';
-				IRST <= '1';
+			if ss_en = '1' then
+				rasterIrqDone <= ss_d(O_RASTERIRQDONE);
+				IRST          <= ss_d(O_IRST);
 			end if;
 		end if;
 	end process;
@@ -855,27 +1225,35 @@ rasterCounters: process(clk, rasterX, rasterXDelay)
 lightPen: process(clk)
 	begin
 		if rising_edge(clk) then
-			if emulateLightpen then
-				if resetLightPenIrq = '1' then
-					-- Reset light pen interrupt
+			if ss_hold = '0' then
+				if emulateLightpen then
+					if resetLightPenIrq = '1' then
+						-- Reset light pen interrupt
+						ILP <= '0';
+					end if;
+					if lastLineFlag then
+						-- Reset lightpen state at beginning of frame
+						lightPenHit <= '0';
+					elsif (lightPenHit = '0') and (lp_n = '0') then
+						-- One hit/frame
+						lightPenHit <= '1';
+						-- Toggle Interrupt
+						ILP <= '1';
+						-- Store position of beam
+						lpx <= rasterX(8 downto 1);
+						lpy <= rasterY(7 downto 0);
+					end if;
+				else
 					ILP <= '0';
-				end if;			
-				if lastLineFlag then
-					-- Reset lightpen state at beginning of frame
-					lightPenHit <= '0';
-				elsif (lightPenHit = '0') and (lp_n = '0') then
-					-- One hit/frame
-					lightPenHit <= '1'; 
-					-- Toggle Interrupt
-					ILP <= '1'; 
-					-- Store position of beam
-					lpx <= rasterX(8 downto 1);
-					lpy <= rasterY(7 downto 0);
+					lpx <= (others => '1');
+					lpy <= (others => '1');
 				end if;
-			else
-				ILP <= '0';
-				lpx <= (others => '1');
-				lpy <= (others => '1');
+			end if;
+			if ss_en = '1' then
+				ILP         <= ss_d(O_ILP);
+				lightPenHit <= ss_d(O_LIGHTPENHIT);
+				lpx         <= unsigned(ss_d(O_LPX+7 downto O_LPX));
+				lpy         <= unsigned(ss_d(O_LPY+7 downto O_LPY));
 			end if;
 		end if;
 	end process;
@@ -890,10 +1268,13 @@ doVBlanking: process(clk, mode6569, mode6567old, mode6567R8)
 		if (mode6567old or mode6567R8) = '1' then
 			rasterBlank := 12;
 		end if;
+		-- rebuilt, not on the chain: (rasterY = rasterBlank), held with the machine
 		if rising_edge(clk) then
-			vBlanking <= '0';
-			if rasterY = rasterBlank then
-				vBlanking <= '1';
+			if ss_hold = '0' then
+				vBlanking <= '0';
+				if rasterY = rasterBlank then
+					vBlanking <= '1';
+				end if;
 			end if;
 		end if;
 	end process;
@@ -916,6 +1297,10 @@ doHBlanking: process(clk)
 				elsif rasterX = 496 then -- from VIC II datasheet
 					hBlanking <= '0';
 				end if;
+			end if;
+			if ss_en = '1' then
+				hBlack    <= ss_d(O_HBLACK);
+				hBlanking <= ss_d(O_HBLANKING);
 			end if;
 		end if;
 	end process;
@@ -972,6 +1357,11 @@ calcBorders: process(clk)
 					end if;
 				end if;
 				TBBorder <= newTBBorder;
+			end if;
+			if ss_en = '1' then
+				MainBorder  <= ss_d(O_MAINBORDER);
+				TBBorder    <= ss_d(O_TBBORDER);
+				setTBBorder <= ss_d(O_SETTBBORDER) = '1';
 			end if;
 		end if;
 	end process;
@@ -1042,6 +1432,22 @@ calcBitmap: process(clk)
 				end if;
 			end if;
 
+			if ss_en = '1' then
+				shifting_ff     <= ss_d(O_SHIFTING_FF);
+				waitingChar_r   <= unsigned(ss_d(O_WAITINGCHAR_R+11 downto O_WAITINGCHAR_R));
+				waitingPixels_r <= unsigned(ss_d(O_WAITINGPIXELS_R+7 downto O_WAITINGPIXELS_R));
+				shiftingChar    <= unsigned(ss_d(O_SHIFTINGCHAR+11 downto O_SHIFTINGCHAR));
+				shiftingPixels  <= unsigned(ss_d(O_SHIFTINGPIXELS+7 downto O_SHIFTINGPIXELS));
+				currentPixels   <= unsigned(ss_d(O_CURRENTPIXELS+1 downto O_CURRENTPIXELS));
+				pixelBgFlag     <= ss_d(O_PIXELBGFLAG);
+				currentPixels_d <= unsigned(ss_d(O_CURRENTPIXELS_D+1 downto O_CURRENTPIXELS_D));
+				shiftingChar_d  <= unsigned(ss_d(O_SHIFTINGCHAR_D+11 downto O_SHIFTINGCHAR_D));
+				MCMDelay        <= ss_d(O_MCMDELAY);
+				ECMDelay        <= ss_d(O_ECMDELAY);
+				BMMDelay        <= ss_d(O_BMMDELAY);
+				waitingPixels   <= unsigned(ss_d(O_WAITINGPIXELS+7 downto O_WAITINGPIXELS));
+				waitingChar     <= unsigned(ss_d(O_WAITINGCHAR+11 downto O_WAITINGCHAR));
+			end if;
 		end if;
 	end process;
 
@@ -1177,6 +1583,15 @@ calcBitmap: process(clk)
 					end if;
 				end if;
 			end if;
+			if ss_en = '1' then
+				MYE_ff <= unsigned(ss_d(O_MYE_FF+7 downto O_MYE_FF));
+				for i in 0 to 7 loop
+					MCBase(i)  <= unsigned(ss_d(O_MCBASE+6*i+5 downto O_MCBASE+6*i));
+					MDMA(i)    <= ss_d(O_MDMA+i) = '1';
+					MCnt(i)    <= unsigned(ss_d(O_MCNT+6*i+5 downto O_MCNT+6*i));
+					MActive(i) <= ss_d(O_MACTIVE+i) = '1';
+				end loop;
+			end if;
 		end if;
 	end process;
 
@@ -1184,11 +1599,12 @@ calcBitmap: process(clk)
 -- Sprite pixel Shift register
 -- -----------------------------------------------------------------------
 	process(clk)
-	variable MShift : MFlags; -- Sprite is shifting
+	variable MShift : MFlags; -- Sprite is shifting (kept in MShift_r between clocks)
 	begin
 
 		if rising_edge(clk) then
 			if enaPixel = '1' then
+				MShift := MShift_r;
 				for i in 0 to 7 loop
 					-- Enable sprites on the correct X position
 					if MActive(i) and rasterXDelay = MX(i) then
@@ -1240,6 +1656,7 @@ calcBitmap: process(clk)
 						MC_ff(i) <= MCDelay(i);
 					end if;
 				end loop;
+				MShift_r <= MShift;
 			end if;
 
 			--
@@ -1258,6 +1675,21 @@ calcBitmap: process(clk)
 					end if;
 					when others => null;
 				end case;
+			end if;
+			if ss_en = '1' then
+				MXE_ff       <= unsigned(ss_d(O_MXE_FF+7 downto O_MXE_FF));
+				MC_ff        <= unsigned(ss_d(O_MC_FF+7 downto O_MC_FF));
+				MC           <= unsigned(ss_d(O_MC+7 downto O_MC));
+				MCColorDelay <= unsigned(ss_d(O_MCCOLORDELAY+7 downto O_MCCOLORDELAY));
+				MCColor      <= unsigned(ss_d(O_MCCOLOR+7 downto O_MCCOLOR));
+				MPixelStore  <= unsigned(ss_d(O_MPIXELSTORE+15 downto O_MPIXELSTORE));
+				for i in 0 to 7 loop
+					MShift_r(i)        <= ss_d(O_MSHIFT+i) = '1';
+					MShift_stop(i)     <= ss_d(O_MSHIFT_STOP+i) = '1';
+					MCurrentPixel_r(i) <= unsigned(ss_d(O_MCURRENTPIXEL_R+2*i+1 downto O_MCURRENTPIXEL_R+2*i));
+					MPixels(i)         <= unsigned(ss_d(O_MPIXELS+24*i+23 downto O_MPIXELS+24*i));
+					MCurrentPixel(i)   <= unsigned(ss_d(O_MCURRENTPIXEL+2*i+1 downto O_MCURRENTPIXEL+2*i));
+				end loop;
 			end if;
 		end if;
 	end process;
@@ -1382,18 +1814,21 @@ calcBitmap: process(clk)
 --			end loop;
 			
 			if enaPixel = '1' then
-				colorIndex <= myColor;
+				colorIndex_r <= myColor;
 
 -- Krestage 3 debugging routine
 --				if (cs = '1' and aRegisters = "011100") then
---					colorIndex <= "1111";
+--					colorIndex_r <= "1111";
 --				end if;
 				if MainBorder = '1' then
-					colorIndex <= EC;
+					colorIndex_r <= EC;
 				end if;
 				if (hBlack = '1') then
-					colorIndex <= (others => '0');
+					colorIndex_r <= (others => '0');
 				end if;
+			end if;
+			if ss_en = '1' then
+				colorIndex_r <= unsigned(ss_d(O_COLORINDEX+3 downto O_COLORINDEX));
 			end if;
 		end if;
 	end process;
@@ -1411,6 +1846,9 @@ collisionClearFlag: process(clk)
 			if phi = '0' and enaPixel = '1' and not (addr_r = "011110" and rd_r = '1') then
 				M2MClr <= '0';
 			end if;
+			if ss_en = '1' then
+				M2MClr <= ss_d(O_M2MCLR);
+			end if;
 		end if;
 	end process;
 
@@ -1420,7 +1858,7 @@ collisionClearFlag: process(clk)
 spriteSpriteCollision: process(clk)
 	begin
 		if rising_edge(clk) then
-			if resetIMMC = '1' then
+			if resetIMMC = '1' and ss_hold = '0' then
 				IMMC <= '0';
 			end if;
 
@@ -1456,6 +1894,12 @@ spriteSpriteCollision: process(clk)
 					M2Mhit <= '0';
 				end if;
 			end if;
+			if ss_en = '1' then
+				IMMC      <= ss_d(O_IMMC);
+				collision <= unsigned(ss_d(O_COLLISION+7 downto O_COLLISION));
+				M2M       <= unsigned(ss_d(O_M2M+7 downto O_M2M));
+				M2Mhit    <= ss_d(O_M2MHIT);
+			end if;
 		end if;
 	end process;
 
@@ -1464,8 +1908,8 @@ spriteSpriteCollision: process(clk)
 -- -----------------------------------------------------------------------
 spriteBackgroundCollision: process(clk)
 	begin
-		if rising_edge(clk) then			
-			if resetIMBC = '1' then
+		if rising_edge(clk) then
+			if resetIMBC = '1' and ss_hold = '0' then
 				IMBC <= '0';
 			end if;
 
@@ -1493,6 +1937,12 @@ spriteBackgroundCollision: process(clk)
 				M2DDelay <= (others => '0');
 				M2Dhit <= '0';
 			end if;
+			if ss_en = '1' then
+				IMBC     <= ss_d(O_IMBC);
+				M2DDelay <= unsigned(ss_d(O_M2DDELAY+7 downto O_M2DDELAY));
+				M2D      <= unsigned(ss_d(O_M2D+7 downto O_M2D));
+				M2Dhit   <= ss_d(O_M2DHIT);
+			end if;
 		end if;
 	end process;
 
@@ -1507,6 +1957,8 @@ spriteBackgroundCollision: process(clk)
 writeRegisters: process(clk)
 	begin
 		if rising_edge(clk) then
+		-- the reset pulses are cleared on every clock: held with the machine
+		if ss_hold = '0' then
 			resetLightPenIrq <= '0';
 			resetIMMC <= '0';
 			resetIMBC <= '0';
@@ -1688,6 +2140,47 @@ writeRegisters: process(clk)
 				end if;
 			end if;
 		end if;
+			if ss_en = '1' then
+				resetLightPenIrq <= ss_d(O_RESETLIGHTPENIRQ);
+				resetIMMC        <= ss_d(O_RESETIMMC);
+				resetIMBC        <= ss_d(O_RESETIMBC);
+				resetRasterIrq   <= ss_d(O_RESETRASTERIRQ);
+				rasterCmp        <= unsigned(ss_d(O_RASTERCMP+8 downto O_RASTERCMP));
+				ECM              <= ss_d(O_ECM);
+				BMM              <= ss_d(O_BMM);
+				DEN              <= ss_d(O_DEN);
+				RSEL             <= ss_d(O_RSEL);
+				yscroll          <= unsigned(ss_d(O_YSCROLL+2 downto O_YSCROLL));
+				ME               <= unsigned(ss_d(O_ME+7 downto O_ME));
+				RES              <= ss_d(O_RES);
+				MCM              <= ss_d(O_MCM);
+				CSEL             <= ss_d(O_CSEL);
+				xscroll          <= unsigned(ss_d(O_XSCROLL+2 downto O_XSCROLL));
+				MYE              <= unsigned(ss_d(O_MYE+7 downto O_MYE));
+				VM               <= unsigned(ss_d(O_VM+3 downto O_VM));
+				CB               <= unsigned(ss_d(O_CB+2 downto O_CB));
+				ELP              <= ss_d(O_ELP);
+				EMMC             <= ss_d(O_EMMC);
+				EMBC             <= ss_d(O_EMBC);
+				ERST             <= ss_d(O_ERST);
+				MPRIO            <= unsigned(ss_d(O_MPRIO+7 downto O_MPRIO));
+				MCDelay          <= unsigned(ss_d(O_MCDELAY+7 downto O_MCDELAY));
+				MXE              <= unsigned(ss_d(O_MXE+7 downto O_MXE));
+				EC               <= unsigned(ss_d(O_EC+3 downto O_EC));
+				B0C              <= unsigned(ss_d(O_B0C+3 downto O_B0C));
+				B1C              <= unsigned(ss_d(O_B1C+3 downto O_B1C));
+				B2C              <= unsigned(ss_d(O_B2C+3 downto O_B2C));
+				B3C              <= unsigned(ss_d(O_B3C+3 downto O_B3C));
+				MM0              <= unsigned(ss_d(O_MM0+3 downto O_MM0));
+				MM1              <= unsigned(ss_d(O_MM1+3 downto O_MM1));
+				turbo_reg        <= ss_d(O_TURBO_REG);
+				for i in 0 to 7 loop
+					MX(i)           <= unsigned(ss_d(O_MX+9*i+8 downto O_MX+9*i));
+					MY(i)           <= unsigned(ss_d(O_MY+8*i+7 downto O_MY+8*i));
+					spriteColors(i) <= unsigned(ss_d(O_SPRITECOLORS+4*i+3 downto O_SPRITECOLORS+4*i));
+				end loop;
+			end if;
+		end if;
 	end process;
 
 -- -----------------------------------------------------------------------
@@ -1698,58 +2191,61 @@ readRegisters: process(clk)
 		if rising_edge(clk) then
 			if myRd = '1' then
 			case aRegisters is
-			when "000000" => do <= MX(0)(7 downto 0);
-			when "000001" => do <= MY(0);
-			when "000010" => do <= MX(1)(7 downto 0);
-			when "000011" => do <= MY(1);
-			when "000100" => do <= MX(2)(7 downto 0);
-			when "000101" => do <= MY(2);
-			when "000110" => do <= MX(3)(7 downto 0);
-			when "000111" => do <= MY(3);
-			when "001000" => do <= MX(4)(7 downto 0);
-			when "001001" => do <= MY(4);
-			when "001010" => do <= MX(5)(7 downto 0);
-			when "001011" => do <= MY(5);
-			when "001100" => do <= MX(6)(7 downto 0);
-			when "001101" => do <= MY(6);
-			when "001110" => do <= MX(7)(7 downto 0);
-			when "001111" => do <= MY(7);
+			when "000000" => do_r <= MX(0)(7 downto 0);
+			when "000001" => do_r <= MY(0);
+			when "000010" => do_r <= MX(1)(7 downto 0);
+			when "000011" => do_r <= MY(1);
+			when "000100" => do_r <= MX(2)(7 downto 0);
+			when "000101" => do_r <= MY(2);
+			when "000110" => do_r <= MX(3)(7 downto 0);
+			when "000111" => do_r <= MY(3);
+			when "001000" => do_r <= MX(4)(7 downto 0);
+			when "001001" => do_r <= MY(4);
+			when "001010" => do_r <= MX(5)(7 downto 0);
+			when "001011" => do_r <= MY(5);
+			when "001100" => do_r <= MX(6)(7 downto 0);
+			when "001101" => do_r <= MY(6);
+			when "001110" => do_r <= MX(7)(7 downto 0);
+			when "001111" => do_r <= MY(7);
 			when "010000" =>
-				do <= MX(7)(8) & MX(6)(8) & MX(5)(8) & MX(4)(8)
+				do_r <= MX(7)(8) & MX(6)(8) & MX(5)(8) & MX(4)(8)
 				& MX(3)(8) & MX(2)(8) & MX(1)(8) & MX(0)(8);
-			when "010001" => do <= rasterY(8) & ECM & BMM & DEN & RSEL & yscroll;
-			when "010010" => do <= rasterY(7 downto 0);
-			when "010011" => do <= lpX;
-			when "010100" => do <= lpY;
-			when "010101" => do <= ME;
-			when "010110" => do <= "11" & RES & MCM & CSEL & xscroll;
-			when "010111" => do <= MYE;
-			when "011000" => do <= VM & CB & '1';
-			when "011001" => do <= IRQ & "111" & ILP & IMMC & IMBC & IRST;
-			when "011010" => do <= "1111" & ELP & EMMC & EMBC & ERST;
-			when "011011" => do <= MPRIO;
-			when "011100" => do <= MC;
-			when "011101" => do <= MXE;
-			when "011110" => do <= M2M;
-			when "011111" => do <= M2D;
-			when "100000" => do <= "1111" & EC;
-			when "100001" => do <= "1111" & B0C;
-			when "100010" => do <= "1111" & B1C;
-			when "100011" => do <= "1111" & B2C;
-			when "100100" => do <= "1111" & B3C;
-			when "100101" => do <= "1111" & MM0;
-			when "100110" => do <= "1111" & MM1;
-			when "100111" => do <= "1111" & spriteColors(0);
-			when "101000" => do <= "1111" & spriteColors(1);
-			when "101001" => do <= "1111" & spriteColors(2);
-			when "101010" => do <= "1111" & spriteColors(3);
-			when "101011" => do <= "1111" & spriteColors(4);
-			when "101100" => do <= "1111" & spriteColors(5);
-			when "101101" => do <= "1111" & spriteColors(6);
-			when "101110" => do <= "1111" & spriteColors(7);
-			when "110000" => do <= "1111111" & (turbo_reg or not turbo_en);
-			when others => do <= (others => '1');
+			when "010001" => do_r <= rasterY(8) & ECM & BMM & DEN & RSEL & yscroll;
+			when "010010" => do_r <= rasterY(7 downto 0);
+			when "010011" => do_r <= lpX;
+			when "010100" => do_r <= lpY;
+			when "010101" => do_r <= ME;
+			when "010110" => do_r <= "11" & RES & MCM & CSEL & xscroll;
+			when "010111" => do_r <= MYE;
+			when "011000" => do_r <= VM & CB & '1';
+			when "011001" => do_r <= IRQ & "111" & ILP & IMMC & IMBC & IRST;
+			when "011010" => do_r <= "1111" & ELP & EMMC & EMBC & ERST;
+			when "011011" => do_r <= MPRIO;
+			when "011100" => do_r <= MC;
+			when "011101" => do_r <= MXE;
+			when "011110" => do_r <= M2M;
+			when "011111" => do_r <= M2D;
+			when "100000" => do_r <= "1111" & EC;
+			when "100001" => do_r <= "1111" & B0C;
+			when "100010" => do_r <= "1111" & B1C;
+			when "100011" => do_r <= "1111" & B2C;
+			when "100100" => do_r <= "1111" & B3C;
+			when "100101" => do_r <= "1111" & MM0;
+			when "100110" => do_r <= "1111" & MM1;
+			when "100111" => do_r <= "1111" & spriteColors(0);
+			when "101000" => do_r <= "1111" & spriteColors(1);
+			when "101001" => do_r <= "1111" & spriteColors(2);
+			when "101010" => do_r <= "1111" & spriteColors(3);
+			when "101011" => do_r <= "1111" & spriteColors(4);
+			when "101100" => do_r <= "1111" & spriteColors(5);
+			when "101101" => do_r <= "1111" & spriteColors(6);
+			when "101110" => do_r <= "1111" & spriteColors(7);
+			when "110000" => do_r <= "1111111" & (turbo_reg or not turbo_en);
+			when others => do_r <= (others => '1');
 			end case;
+			end if;
+			if ss_en = '1' then
+				do_r <= unsigned(ss_d(O_DO+7 downto O_DO));
 			end if;
 		end if;
 	end process;

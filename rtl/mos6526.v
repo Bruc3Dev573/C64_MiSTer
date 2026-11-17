@@ -3,6 +3,13 @@
 // Timers & Interrupts are rewritten by slingshot
 // Passes all Lorenz CIA Timer tests
 // Passes all CIA tests from VICE, except dd0dtest
+//
+// Savestate scan chain (WP A4, docs/SAVESTATES.md): segment CIA1/CIA2 of
+// savestate/map.yaml, bit 0 (cnt_in_prev) leaves first. The logic that runs
+// on every clock instead of on phi2/cs (FLAG and TOD edge detectors, TOD
+// counter, the 8521 IRQ path) holds while ss_hold is high. pa_out, pb_out and
+// pc_n drive the keyboard, the IEC bus and the parallel cable on every clock,
+// so they never shift: the chain carries copies written back on ss_load_done.
 
 module mos6526 (
   input  wire       mode,   // 0 - 6526 "old", 1 - 8521 "new"
@@ -36,7 +43,14 @@ module mos6526 (
   input  wire       cnt_in,
   output reg        cnt_out,
 
-  output reg        irq_n
+  output reg        irq_n,
+
+  // savestate scan chain
+  input  wire       ss_en,
+  input  wire       ss_hold,
+  input  wire       ss_load_done,
+  input  wire       ss_si,
+  output wire       ss_so
 );
 
 // Internal Registers
@@ -78,14 +92,51 @@ reg        tod_latched;
 reg        sp_pending;
 reg        sp_transmit;
 reg [ 7:0] sp_shiftreg;
+reg        sp_out_reg;
 reg        icr3;
 
 reg        cnt_in_prev;
 reg        cnt_in_r;
 reg        cnt_out_r;
 reg [ 2:0] cnt_pulsecnt;
+reg        cra6_prev;
 
 reg        int_reset;
+reg [ 7:0] imr_reg;
+reg        old_flag, flag;
+reg        pcr;
+
+reg        countA0, countA1, countA2, countA3, loadA1, oneShotA0;
+reg        timerAff;
+reg        countB0, countB1, countB2, countB3, loadB1, oneShotB0;
+reg        timerBff;
+
+// savestate: copies of the pins, the segment vector and its shifted value
+reg  [7:0] ss_pa_out, ss_pb_out;
+reg        ss_pc_n;
+wire [281:0] ss_q = {
+  tod_tick, tod_sec, tod_run, tod_prev, tod_min, tod_latched, tod_latch, tod_hr, tod_count,
+  tod_alarm_reg, tod_alarm, tod_10ths, timer_b_int, timer_b, timer_a, timerBff, timerAff,
+  tb_lo, tb_hi, ta_lo, ta_hi, sp_transmit, sp_shiftreg, sp_pending, sp_out_reg, sdr, prb, pra,
+  pcr, ss_pc_n, ss_pb_out, ss_pa_out, oneShotB0, oneShotA0, loadB1, loadA1, irq_n, int_reset,
+  imr_reg, imr, icr3, icr, flag, ddrb, ddra, db_out, crb, cra6_prev, cra,
+  countB3, countB2, countB1, countB0, countA3, countA2, countA1, countA0,
+  cnt_pulsecnt, cnt_out_r, cnt_out, cnt_in_r, cnt_in_prev };
+wire [281:0] ss_d = {ss_si, ss_q[281:1]};
+assign ss_so = ss_q[0];
+
+always @(posedge clk) begin
+  if (ss_en) begin
+    ss_pa_out <= ss_d[89:82];
+    ss_pb_out <= ss_d[97:90];
+    ss_pc_n   <= ss_d[98];
+  end
+  else if (!ss_hold) begin
+    ss_pa_out <= pa_out;
+    ss_pb_out <= pb_out;
+    ss_pc_n   <= pc_n;
+  end
+end
 
 wire       rd = phi2_n & !cs_n & rw;
 wire       wr = phi2_n & !cs_n & !rw;
@@ -112,6 +163,7 @@ always @(posedge clk) begin
       4'he: db_out <= {cra[7:5], 1'b0, cra[3:0]};
       4'hf: db_out <= {crb[7:5], 1'b0, crb[3:0]};
     endcase
+  if (ss_en) db_out <= ss_d[39:32];
 end
 
 assign pa_oe = ddra;
@@ -130,6 +182,11 @@ always @(posedge clk) begin
       default: ;
     endcase
   if (phi2_p) pa_out <= pra | ~ddra;
+  if (ss_en) begin
+    pra  <= ss_d[107:100];
+    ddra <= ss_d[47:40];
+  end
+  if (ss_load_done) pa_out <= ss_pa_out;
 end
 
 // Port B Output
@@ -149,15 +206,21 @@ always @(posedge clk) begin
     pb_out[6]   <= cra[1] ? (cra[2] ? timerAff ^ timerAoverflow : timerAoverflow) : prb[6] | ~ddrb[6];
     pb_out[5:0] <= prb[5:0] | ~ddrb[5:0];
   end
+  if (ss_en) begin
+    prb  <= ss_d[115:108];
+    ddrb <= ss_d[55:48];
+  end
+  if (ss_load_done) pb_out <= ss_pb_out;
 end
 
-// FLAG Input
+// FLAG Input: the edge detector follows the live pin on every clock. While the
+// engine owns the machine it latches no edge ('flag' is on the chain) but keeps
+// following, so a load that changes the pin (the loaded outputs of a drive
+// appear before the release) does not fake an edge.
 always @(posedge clk) begin
-	reg old_flag, flag;
-
 	old_flag <= flag_n;
-	if(old_flag & ~flag_n) flag <= 1'b1;
-  
+	if(!ss_hold & old_flag & ~flag_n) flag <= 1'b1;
+
 	if (!res_n) begin
 		icr[4] <= 1'b0;
 		flag <= 1'b0;
@@ -171,21 +234,24 @@ always @(posedge clk) begin
 			end
 		end
 	end
+	if (ss_en) begin
+		icr[4] <= ss_d[61];
+		flag   <= ss_d[56];
+	end
 end
 
 // Port Control Output
-reg pcr;
 always @(posedge clk) begin
   if (!cs_n && rs == 4'h1) pcr <= 1'b0;
   if (phi2_p) begin
 	 pc_n <= pcr;
 	 pcr  <= 1'b1;
   end
+  if (ss_en) pcr <= ss_d[99];
+  if (ss_load_done) pc_n <= ss_pc_n;
 end
 
 // Timer A
-reg countA0, countA1, countA2, countA3, loadA1, oneShotA0;
-reg timerAff;
 wire timerAin = cra[5] ? countA1 : 1'b1;
 wire [15:0] newTimerAVal = countA3 ? (timer_a - 1'b1) : timer_a;
 wire timerAoverflow = !newTimerAVal & countA2;
@@ -251,11 +317,23 @@ always @(posedge clk) begin
         default: ;
       endcase;
   end
+  if (ss_en) begin
+    ta_lo     <= ss_d[150:143];
+    ta_hi     <= ss_d[142:135];
+    cra       <= ss_d[22:15];
+    timer_a   <= ss_d[184:169];
+    timerAff  <= ss_d[167];
+    icr[0]    <= ss_d[57];
+    countA0   <= ss_d[7];
+    countA1   <= ss_d[8];
+    countA2   <= ss_d[9];
+    countA3   <= ss_d[10];
+    loadA1    <= ss_d[78];
+    oneShotA0 <= ss_d[80];
+  end
 end
 
 // Timer B
-reg countB0, countB1, countB2, countB3, loadB1, oneShotB0;
-reg timerBff;
 wire timerBin = crb[6] ? timerAoverflow & (~crb[5] | cnt_in_r) : (~crb[5] | countB1);
 wire [15:0] newTimerBVal = countB3 ? (timer_b - 1'b1) : timer_b;
 wire timerBoverflow = !newTimerBVal & countB2;
@@ -328,6 +406,21 @@ always @(posedge clk) begin
         default: ;
       endcase;
   end
+  if (ss_en) begin
+    tb_lo       <= ss_d[166:159];
+    tb_hi       <= ss_d[158:151];
+    crb         <= ss_d[31:24];
+    timer_b     <= ss_d[200:185];
+    timerBff    <= ss_d[168];
+    icr[1]      <= ss_d[58];
+    timer_b_int <= ss_d[201];
+    countB0     <= ss_d[11];
+    countB1     <= ss_d[12];
+    countB2     <= ss_d[13];
+    countB3     <= ss_d[14];
+    loadB1      <= ss_d[79];
+    oneShotB0   <= ss_d[81];
+  end
 end
 
 // Time of Day
@@ -368,45 +461,48 @@ always @(posedge clk) begin
             end
       default: ;
     endcase
-  tod_prev <= tod;
-  tod_tick <= 1'b0;
-  if (tod_run) begin
-    tod_count <= (tod && !tod_prev) ? tod_count + 1'b1 : tod_count;
-    if ((cra[7] && tod_count == 3'h5) || tod_count == 3'h6) begin
-      tod_tick  <= 1'b1;
-      tod_count <= 3'h0;
-    end
-    if (tod_tick) begin
-      tod_10ths <= (tod_10ths == 4'h9) ? 1'b0 : tod_10ths + 1'b1;
-      if (tod_10ths == 4'h9) begin
-        tod_sec[3:0] <= tod_sec[3:0] + 1'b1;
-        if (tod_sec[3:0] == 4'h9) begin
-          tod_sec[3:0] <= 4'h0;
-          tod_sec[6:4] <= tod_sec[6:4] + 1'b1;
+  // the 50/60 Hz input is sampled on every clock: held with the machine
+  if (!ss_hold) begin
+    tod_prev <= tod;
+    tod_tick <= 1'b0;
+    if (tod_run) begin
+      tod_count <= (tod && !tod_prev) ? tod_count + 1'b1 : tod_count;
+      if ((cra[7] && tod_count == 3'h5) || tod_count == 3'h6) begin
+        tod_tick  <= 1'b1;
+        tod_count <= 3'h0;
+      end
+      if (tod_tick) begin
+        tod_10ths <= (tod_10ths == 4'h9) ? 1'b0 : tod_10ths + 1'b1;
+        if (tod_10ths == 4'h9) begin
+          tod_sec[3:0] <= tod_sec[3:0] + 1'b1;
+          if (tod_sec[3:0] == 4'h9) begin
+            tod_sec[3:0] <= 4'h0;
+            tod_sec[6:4] <= tod_sec[6:4] + 1'b1;
+          end
+          if (tod_sec == 7'h59) begin
+            tod_sec[6:4] <= 3'h0;
+            tod_min[3:0] <= tod_min[3:0] + 1'b1;
+          end
+          if (tod_min[3:0] == 4'h9 && tod_sec == 7'h59) begin
+            tod_min[3:0] <= 4'h0;
+            tod_min[6:4] <= tod_min[6:4] + 1'b1;
+          end
+          if (tod_min == 7'h59 && tod_sec == 7'h59) begin
+            tod_min[6:4] <= 3'h0;
+            tod_hr[3:0]  <= tod_hr[3:0] + 1'b1;
+          end
+          if (tod_hr[3:0] == 4'h9 && tod_min == 7'h59 && tod_sec == 7'h59) begin
+            tod_hr[4]   <= 1'b1;
+            tod_hr[3:0] <= tod_hr[4] ? tod_hr[3:0] + 1'b1 : 4'h0;
+          end
+          if (tod_min == 7'h59 && tod_sec == 7'h59)
+            if (tod_hr[4:0] == 5'h11) tod_hr[5] <= ~tod_hr[5];
+            else if (tod_hr[4:0] == 5'h12) tod_hr[4:0] <= 5'h01;
         end
-        if (tod_sec == 7'h59) begin
-          tod_sec[6:4] <= 3'h0;
-          tod_min[3:0] <= tod_min[3:0] + 1'b1;
-        end
-        if (tod_min[3:0] == 4'h9 && tod_sec == 7'h59) begin
-          tod_min[3:0] <= 4'h0;
-          tod_min[6:4] <= tod_min[6:4] + 1'b1;
-        end
-        if (tod_min == 7'h59 && tod_sec == 7'h59) begin
-          tod_min[6:4] <= 3'h0;
-          tod_hr[3:0]  <= tod_hr[3:0] + 1'b1;
-        end
-        if (tod_hr[3:0] == 4'h9 && tod_min == 7'h59 && tod_sec == 7'h59) begin
-          tod_hr[4]   <= 1'b1;
-          tod_hr[3:0] <= tod_hr[4] ? tod_hr[3:0] + 1'b1 : 4'h0;
-        end
-        if (tod_min == 7'h59 && tod_sec == 7'h59)
-          if (tod_hr[4:0] == 5'h11) tod_hr[5] <= ~tod_hr[5];
-          else if (tod_hr[4:0] == 5'h12) tod_hr[4:0] <= 5'h01;
       end
     end
+    else tod_count <= 3'h0;
   end
-  else tod_count <= 3'h0;
 
   if (phi2_p) begin
     if (!tod_latched) tod_latch <= {tod_hr, tod_min, tod_sec, tod_10ths};
@@ -417,16 +513,32 @@ always @(posedge clk) begin
     end
     else tod_alarm_reg <= 1'b0;
   end
+  if (ss_en) begin
+    tod_10ths     <= ss_d[205:202];
+    tod_alarm     <= ss_d[229:206];
+    tod_alarm_reg <= ss_d[230];
+    tod_count     <= ss_d[233:231];
+    tod_hr        <= ss_d[239:234];
+    tod_latch     <= ss_d[263:240];
+    tod_latched   <= ss_d[264];
+    tod_min       <= ss_d[271:265];
+    tod_prev      <= ss_d[272];
+    tod_run       <= ss_d[273];
+    tod_sec       <= ss_d[280:274];
+    tod_tick      <= ss_d[281];
+    icr[2]        <= ss_d[59];
+  end
 end
 
-reg    sp_out_reg;
 assign sp_out = sp_out_reg | ~cra[6];
 
 // Serial Port Input/Output
+wire [7:0] sp_in_shift = {sp_shiftreg[6:0], sp_in};
+
 always @(posedge clk) begin
   if (!res_n) begin
-    sp_shiftreg  = 8'h00;
-    sp_out_reg   = 1'b0;
+    sp_shiftreg <= 8'h00;
+    sp_out_reg  <= 1'b0;
     sdr         <= 8'h00;
     sp_pending  <= 1'b0;
     sp_transmit <= 1'b0;
@@ -450,9 +562,9 @@ always @(posedge clk) begin
 
       if (!cra[6]) begin // input
         if (cnt_in_r && !cnt_in_prev) begin
-          sp_shiftreg = { sp_shiftreg[6:0], sp_in };
+          sp_shiftreg <= sp_in_shift;
           if (cnt_pulsecnt == 3'h0) begin
-            sdr  <= sp_shiftreg;
+            sdr  <= sp_in_shift;
             icr3 <= 1'b1;
           end
         end
@@ -462,23 +574,31 @@ always @(posedge clk) begin
         if (sp_pending && !sp_transmit) begin
           sp_pending  <= 1'b0;
           sp_transmit <= 1'b1;
-          sp_shiftreg  = sdr;
+          sp_shiftreg <= sdr;
         end
         else if (!cnt_out_r && cnt_out) begin
           if (cnt_pulsecnt == 3'h7) begin
             icr3        <= 1'b1;
             sp_transmit <= 1'b0;
           end
-          { sp_out_reg, sp_shiftreg } = { sp_shiftreg, 1'b0 };
+          { sp_out_reg, sp_shiftreg } <= { sp_shiftreg, 1'b0 };
         end
       end
     end
+  end
+  if (ss_en) begin
+    sp_shiftreg <= ss_d[133:126];
+    sp_out_reg  <= ss_d[124];
+    sdr         <= ss_d[123:116];
+    sp_pending  <= ss_d[125];
+    sp_transmit <= ss_d[134];
+    icr[3]      <= ss_d[60];
+    icr3        <= ss_d[62];
   end
 end
 
 // CNT Input/Output
 always @(posedge clk) begin
-  reg cra6_prev;
   if (!res_n) begin
     cnt_in_r     <= 1'b1;
     cnt_in_prev  <= 1'b1;
@@ -499,14 +619,20 @@ always @(posedge clk) begin
     if (!cra[6]) cnt_out_r <= 1'b1;
     else if (timerAoverflow) cnt_out_r <= ~(sp_transmit & cnt_out_r);
   end
+  if (ss_en) begin
+    cnt_in_prev  <= ss_d[0];
+    cnt_in_r     <= ss_d[1];
+    cnt_out      <= ss_d[2];
+    cnt_out_r    <= ss_d[3];
+    cnt_pulsecnt <= ss_d[6:4];
+    cra6_prev    <= ss_d[23];
+  end
 end
 
 wire [4:0] icr_adj = {icr[4:2], timer_b_int, icr[0]};
 
-// Interrupt Control
+// Interrupt Control (the 8521 path runs on every clock: held with the machine)
 always @(posedge clk) begin
-  reg [7:0] imr_reg;
-
   if (!res_n) begin
     imr       <= 5'h00;
     imr_reg   <= 0;
@@ -517,7 +643,7 @@ always @(posedge clk) begin
     if (wr && rs == 4'hd) imr_reg <= db_in;
     if (rd && rs == 4'hd) int_reset <= 1;
 
-    if (phi2_p | mode) begin
+    if ((phi2_p | mode) & !ss_hold) begin
       imr <= imr_reg[7] ? imr | imr_reg[4:0] : imr & ~imr_reg[4:0];
       irq_n <= irq_n ? ~|(imr & icr_adj) : irq_n;
     end
@@ -525,6 +651,12 @@ always @(posedge clk) begin
       irq_n <= 1;
 	  int_reset <= 0;
     end
+  end
+  if (ss_en) begin
+    imr       <= ss_d[67:63];
+    imr_reg   <= ss_d[75:68];
+    irq_n     <= ss_d[77];
+    int_reset <= ss_d[76];
   end
 end
 

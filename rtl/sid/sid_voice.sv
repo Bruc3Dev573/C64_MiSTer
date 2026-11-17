@@ -23,7 +23,14 @@ module sid_voice
 	output        osc_msb_out,
 	output [21:0] voice_out,
 	output [ 7:0] osc_out,
-	output [ 7:0] env_out
+	output [ 7:0] env_out,
+
+	// savestate scan chain: the voice runs on ce_1m, which stops with the
+	// machine; 'stop' (machine stopped) only goes on to the envelope
+	input         ss_en,
+	input         stop,
+	input         ss_si,
+	output        ss_so
 );
 
 localparam        [12:0] WAVEFORM_DC_6581 = 13'h380;         // OSC3 = 'h38 at 5.94V.
@@ -49,6 +56,7 @@ assign env_out     = envelope;
 
 // Envelope Instantiation
 wire [7:0] envelope;
+wire       ss_adsr_si;
 sid_envelope adsr
 (
 	.clock(clock),
@@ -57,20 +65,34 @@ sid_envelope adsr
 	.gate(control[0]),
 	.att_dec(att_dec),
 	.sus_rel(sus_rel),
-	.envelope(envelope)
+	.envelope(envelope),
+	.ss_en(ss_en),
+	.stop(stop),
+	.ss_si(ss_adsr_si),
+	.ss_so(ss_so)
 );
+
+// savestate: voice registers, then the envelope (ss_si -> voice -> adsr -> ss_so)
+reg         test_delay;
+reg         clk, clk_d;
+reg         osc_edge;
+reg  [23:0] noise_age;
+reg  [22:0] lfsr_noise;
+reg  [23:0] keep_cnt;
+reg signed  [8:0] env_dac;
+reg signed [12:0] dac_out;
+wire [176:0] ss_q, ss_d;
 
 // Phase Accumulating Oscillator
 reg  [23:0] oscillator;
 reg         osc_msb_in_prv;
 always @(posedge clock) begin
-	reg test_delay;
-
 	if(ce_1m) begin
 		osc_msb_in_prv <= osc_msb_in;
 		test_delay <= mode & test_ctrl;
 		oscillator <= (reset || test_ctrl || test_delay || (sync_ctrl && ~osc_msb_in && osc_msb_in_prv)) ? 24'd0 : (oscillator + freq);
 	end
+	if (ss_en) {test_delay, osc_msb_in_prv, oscillator} <= ss_d[25:0];
 end
 
 assign acc_t = {oscillator[23], oscillator[22:12] ^ {11{~control[5] & ((ringmod_ctrl & ~osc_msb_in) ^ oscillator[23])}}};
@@ -80,11 +102,6 @@ reg [11:0] noise;
 reg [11:0] saw_tri;
 reg        pulse;
 always @(posedge clock) begin
-	reg clk, clk_d;
-	reg osc_edge;
-	reg [23:0] noise_age;
-	reg [22:0] lfsr_noise;
-
 	if (reset) begin
 		saw_tri    <= 0;
 		pulse      <= 0;
@@ -128,6 +145,7 @@ always @(posedge clock) begin
 			end
 		 end
 	end
+	if (ss_en) {lfsr_noise, noise_age, osc_edge, clk_d, clk, pulse, saw_tri, noise} <= ss_d[100:26];
 end
 
 reg  [11:0] norm;
@@ -172,15 +190,14 @@ sid_dac #(.BITS (8)) envelope_dac
 
 // for OSC3 readback
 reg [7:0] wave_out;
-always @(posedge clock) if(ce_1m) wave_out <= norm[11:4] | comb;
+always @(posedge clock) begin
+	if(ce_1m) wave_out <= norm[11:4] | comb;
+	if(ss_en) wave_out <= ss_d[108:101];
+end
 
 // DAC with floating input simulation
 reg signed [21:0] dca_out;
 always @(posedge clock) begin
-	reg        [23:0] keep_cnt;
-	reg signed  [8:0] env_dac;
-	reg signed [12:0] dac_out;
-
 	if(ce_1m) begin
 		if(control[7:4]) begin
 			keep_cnt <= mode ? WF_0_TTL_8580 : WF_0_TTL_6581;
@@ -192,6 +209,12 @@ always @(posedge clock) begin
 		env_dac <= mode ? envelope : env_6581;
 		dca_out <= (mode ? VOICE_DC_8580 : VOICE_DC_6581) + (dac_out * env_dac);
 	end
+	if (ss_en) {dca_out, dac_out, env_dac, keep_cnt} <= ss_d[176:109];
 end
+
+assign ss_q = {dca_out, dac_out, env_dac, keep_cnt, wave_out, lfsr_noise, noise_age, osc_edge, clk_d, clk,
+               pulse, saw_tri, noise, test_delay, osc_msb_in_prv, oscillator};
+assign ss_d = {ss_si, ss_q[176:1]};
+assign ss_adsr_si = ss_q[0];
 
 endmodule

@@ -556,6 +556,7 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL o_divrun : std_logic;
 	SIGNAL o_hacpt,o_vacpt : unsigned(11 DOWNTO 0);
 	SIGNAL o_vacptl : unsigned(1 DOWNTO 0);
+	SIGNAL o_vacpt_gt,o_vacpt_eq : boolean; -- C64 core local change: o_vacpt vs o_ivsize, one clock ahead (timing)
 	signal o_newres : integer range 0 to 3;
 
 	-----------------------------------------------------------------------------
@@ -2910,14 +2911,18 @@ BEGIN
 				-- CYCLE 3-7
 				o_vpix_inner(1 TO 5)<=o_vpix_inner(0 TO 4);
 
-				-- CYCLE 8
-				IF to_integer(o_vacpt)>o_ivsize THEN
+				-- CYCLE 8 (C64 core local change: the compare of o_vacpt with o_ivsize
+				-- is registered one clock before its use; both change only in the
+				-- output sync periods, so no displayed pixel sees the extra clock)
+				o_vacpt_gt<=to_integer(o_vacpt)>o_ivsize;
+				o_vacpt_eq<=to_integer(o_vacpt)=o_ivsize;
+				IF o_vacpt_gt THEN
 					IF fracnn_v = '0' THEN
 						o_vpixq_pre<=(o_vpix_outer(0), o_vpix_inner(5), o_vpix_inner(5), o_vpix_inner(5));
 					ELSE
 						o_vpixq_pre<=(o_vpix_outer(0), o_vpix_outer(1), o_vpix_outer(1), o_vpix_outer(1));
 					END IF;
-				ELSIF to_integer(o_vacpt)=o_ivsize THEN
+				ELSIF o_vacpt_eq THEN
 					IF fracnn_v = '0' THEN
 						o_vpixq_pre<=(o_vpix_outer(0), o_vpix_inner(5), o_vpix_outer(1), o_vpix_outer(1));
 					ELSE

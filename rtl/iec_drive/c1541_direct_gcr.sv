@@ -44,7 +44,19 @@ module c1541_direct_gcr
 	input  [13:0] sd_buff_addr,
 	input  [63:0] sd_buff_dout,
 	output [63:0] sd_buff_din,
-	input         sd_buff_wr
+	input         sd_buff_wr,
+
+	// savestate (WP A8): chain (bit 0 out first: the head/encoder registers,
+	// then the noise LFSR) and the TRACK region, a byte port on port a of the
+	// track buffer while the engine owns the machine (ss_hold)
+	input         ss_en,
+	input         ss_si,
+	output        ss_so,
+	input         ss_hold,
+	input  [12:0] ss_addr,
+	input   [7:0] ss_wdata,
+	input         ss_wr,
+	output  [7:0] ss_rgn_q
 );
 
 assign we          = buff_we;
@@ -56,17 +68,18 @@ reg [12:0] track_len, track_new, len_valid;
 
 // snoop track size
 wire len_update = sd_buff_wr && (sd_buff_addr[13:3] == 0);
-always @(posedge sd_clk) if(len_update) begin
-	track_new[12:0] <= sd_buff_dout[12:0];
+always @(posedge sd_clk) begin
+	if (ss_en) track_new <= ss_d[107:95];
+	else if(len_update) track_new[12:0] <= sd_buff_dout[12:0];
 end
 
 iecdrv_bitmem64 #(10) buffer
 (
 	.clock_a(sd_clk),
-	.address_a(sd_buff_addr[12:3]),
-	.data_a(sd_buff_dout),
+	.address_a(ss_hold ? ss_addr[12:3] : sd_buff_addr[12:3]),
+	.data_a(ss_hold ? {8{ss_wdata}} : sd_buff_dout),
 	// wrap-around write protection
-	.wren_a(sd_buff_wr & ~sd_buff_addr[13]),
+	.wren_a(ss_hold ? {7'd0, ss_wr} << ss_addr[2:0] : {8{sd_buff_wr & ~sd_buff_addr[13]}}),
 	.q_a(sd_buff_do),
 
 	.clock_b(clk),
@@ -77,29 +90,39 @@ iecdrv_bitmem64 #(10) buffer
 );
 
 wire [63:0] sd_buff_do;
+assign      ss_rgn_q = sd_buff_do[{ss_addr[2:0], 3'b000} +: 8];
 reg  [15:0] buff_addr;
 reg   [7:0] buff_di;
 wire        buff_do;
 reg         buff_we;
 
 wire [31:0] random_data;
+wire        lfsr_so;
 random_xor lfsr(
 	.clock(clk),
 	.reset(reset),
+	.ce(ce),
 	.seed(0),
-	.lfsr(random_data)
+	.lfsr(random_data),
+	.ss_en(ss_en),
+	.ss_si(ss_si),
+	.ss_so(lfsr_so)
 );
 
 reg [8:0] reload_flux  = 9'd288;
 reg [8:0] reload_noise = 9'd32;
 
 // Precompute random noise delays so flux events load the timer.
+// (on the drive clock enable: the noise source stops with the machine)
 always @(posedge clk) begin
-	if (random_data[20:16] < 5'd31)
-		reload_flux <= 9'd288 + {4'd0, random_data[20:16]};
+	if (ss_en) {reload_noise, reload_flux} <= ss_d[181:164];
+	else if (ce) begin
+		if (random_data[20:16] < 5'd31)
+			reload_flux <= 9'd288 + {4'd0, random_data[20:16]};
 
-	if (random_data[24:16] < 9'd367)
-		reload_noise <= 9'd32 + random_data[24:16];
+		if (random_data[24:16] < 9'd367)
+			reload_noise <= 9'd32 + random_data[24:16];
+	end
 end
 
 // 1541 part designations are based on the schematics in:
@@ -145,6 +168,15 @@ reg        [31:0] wbl_step_cnt;
 reg signed [9:0]  wbl_offset;
 reg               wbl_dir;
 
+// savestate chain (WP A8), bit 0 leaves first (gcr_ fields of DRV8_1541 /
+// DRV9_1541), then the LFSR (its own chain port). buff_we is a write pulse
+// that is 0 whenever the machine is stopped: not on the chain.
+wire [181:0] ss_q = {reload_noise, reload_flux, wbl_dir, wbl_offset, wbl_step_cnt, len_valid, track_new, track_len,
+                     rot_clk_cnt, flux_cnt, align_revs, ht, hf, buff_di, UF4_enc_phase_cnt, UE6_enc_clk_cnt,
+                     UD3_bit_cnt_w, UE3_bit_cnt, shreg, buff_addr};
+wire [181:0] ss_d = {lfsr_so, ss_q[181:1]};
+assign ss_so = ss_q[0];
+
 // use len_valid as proxy for empty (half) tracks
 wire [12:0] track_new_adj = (track_new > 'd6000) ? track_new : len_valid;
 wire [12:0] track_len_adj = (track_len > 'd6000) ? track_len : len_valid;
@@ -165,7 +197,12 @@ end
 always @(posedge clk) begin
 	buff_we <= 0;
 
-	if(reset) begin
+	if (ss_en) begin
+		{wbl_dir, wbl_offset, wbl_step_cnt, len_valid} <= ss_d[163:108];
+		{track_len, rot_clk_cnt, flux_cnt, align_revs, ht, hf, buff_di, UF4_enc_phase_cnt, UE6_enc_clk_cnt,
+		 UD3_bit_cnt_w, UE3_bit_cnt, shreg, buff_addr} <= ss_d[94:0];
+	end
+	else if(reset) begin
 		// Drive inferred ROM's write ports to silence warning 10030 cleanly
 		rec[0] <= 14'((1 << 26) / (0 + 6000));
 

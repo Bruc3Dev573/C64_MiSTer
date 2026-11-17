@@ -98,7 +98,15 @@ module c1541_track #(parameter BURST_LEN = 32)
 
 	// Background Save Interface
 	input  [13:0] sd_buff_addr,
-	output [63:0] bg_buff_dout
+	output [63:0] bg_buff_dout,
+
+	// savestate (WP A8)
+	input         stop,          // drive stopped with the machine
+	input         remount,       // a load brought the state of another mounted image
+	input         ss_en,
+	input         ss_si,
+	output        ss_so,
+	output        ss_idle        // no foreground transfer and none about to start
 );
 
 // -----------------------------------------------------------------------------
@@ -130,12 +138,13 @@ localparam FINISH_BEAT            = 4'd15;
 // External Signal Synchronization
 // -----------------------------------------------------------------------------
 
-wire [6:0] track_s;
-wire       change_s, save_track_s, reset_s;
+// track and save_track come from the drive (saved): their synchronizers are
+// on the chain and hold with the drive. change and reset follow the host.
+reg  [6:0] trk_s1, trk_s2, track_s;
+reg        sv_s1, sv_s2, save_track_s;
+wire       change_s, reset_s;
 
-iecdrv_sync #(7) track_sync  (clk, track,      track_s);
 iecdrv_sync #(1) change_sync (clk, change,     change_s);
-iecdrv_sync #(1) save_sync   (clk, save_track, save_track_s);
 iecdrv_sync #(1) reset_sync  (clk, reset,      reset_s);
 
 // -----------------------------------------------------------------------------
@@ -145,10 +154,11 @@ iecdrv_sync #(1) reset_sync  (clk, reset,      reset_s);
 wire [28:0] ddr_base_addr_q = 29'h06000000 + (drive_num ? 29'h00040000 : 29'h0);
 reg  [28:0] ddr_offset_q;
 
+// no new request while the drive is stopped (beats already requested are taken)
 assign DDRAM_ADDR     = ddr_base_addr_q + ddr_offset_q;
 assign DDRAM_BURSTCNT = (dma_state == REQ_BURST_RD) ? dma_burst_len : 8'd1;
-assign DDRAM_RD       = (dma_state == REQ_OFFSET_RD) || (dma_state == REQ_BURST_RD);
-assign DDRAM_WE       = (dma_state == WRITE_TO_DDRAM);
+assign DDRAM_RD       = ((dma_state == REQ_OFFSET_RD) || (dma_state == REQ_BURST_RD)) & ~stop;
+assign DDRAM_WE       = (dma_state == WRITE_TO_DDRAM) & ~stop;
 assign DDRAM_DIN      = dma_data_latch;
 assign DDRAM_BE       = (dma_state == WRITE_TO_DDRAM) ? be_mask : 8'hFF;
 
@@ -228,17 +238,36 @@ assign busy_flushing = (|dirty_tracks) || sd_state || ((dma_state != IDLE) && bg
 // DMA Control FSM
 // -----------------------------------------------------------------------------
 
+// The drive's view of the image is saved: which track is in the buffer, its
+// G64 offset, a pending reload (update), the write-back edge detector and the
+// synchronizers of track/save_track. The transfer registers (dma_*) are idle
+// at a savestate boundary (ss_idle) and set again by the next transfer.
+reg [31:0] cur_track_offset; // G64 image track offset in bytes
+reg  [6:0] cur_track = 0;
+reg  [6:0] track_new;
+reg        update = 0;
+reg        old_change = 0;
+reg        old_save_track = 0;
+reg        old_ack = 0;
+
+// The FSM holds while the drive is stopped, except in the two states that
+// take read beats already requested (stop also masks new requests).
+wire fsm_hold = stop && (dma_state != READ_OFFSET) && (dma_state != BURST_DDRAM_TO_BUFF);
+
+// savestate chain, bit 0 leaves first (trk_ fields of DRV8_1541 / DRV9_1541)
+wire [71:0] ss_q = {save_track_s, sv_s2, sv_s1, track_s, trk_s2, trk_s1, old_save_track, update, track_new,
+                    cur_track, cur_track_offset};
+wire [71:0] ss_d = {ss_si, ss_q[71:1]};
+assign ss_so = ss_q[0];
+
+// savestate boundary: no foreground transfer, and none can start in the two
+// clocks before the drive stops (trigger pipelines settled), or held in reset
+assign ss_idle = (reset & reset_s) |
+                 (((dma_state == IDLE) | bg_state) & ~update & (cur_track == track_new) & (track_new == track_s) &
+                  (track_s == trk_s2) & (trk_s2 == trk_s1) & (trk_s1 == track) & (old_save_track == save_track_s) &
+                  (save_track_s == sv_s2) & (sv_s2 == sv_s1) & (sv_s1 == save_track));
+
 always @(posedge clk) begin
-    reg [31:0] cur_track_offset; // G64 image track offset in bytes
-	reg [6:0]  cur_track = 0;
-	reg [6:0]  track_new;
-	reg update     = 0;
-	reg old_change = 0;
-	reg old_save_track = 0;
-	reg old_ack = 0;
-
-	track_new <= track_s;
-
 	old_change <= change_s;
 	if(~old_change & change_s) begin
 		update <= 1;
@@ -247,8 +276,19 @@ always @(posedge clk) begin
 
 	old_ack <= sd_ack;
 	if(sd_ack) {sd_rd,sd_wr} <= 0;
+	if(sd_state && old_ack && ~sd_ack) sd_state <= 0;
 
-	if (reset_s) begin
+	if (~stop) begin
+		trk_s1 <= track;
+		trk_s2 <= trk_s1;
+		if (trk_s1 == trk_s2) track_s <= trk_s2;
+		sv_s1 <= save_track;
+		sv_s2 <= sv_s1;
+		if (sv_s1 == sv_s2) save_track_s <= sv_s2;
+		track_new <= track_s;
+	end
+
+	if (reset_s & ~fsm_hold) begin
 		dma_state <= IDLE;
 		sd_state  <= 0;
 		bg_state  <= 0;
@@ -260,13 +300,7 @@ always @(posedge clk) begin
 		old_save_track <= save_track_s;
 		dirty_tracks   <= 0;
 		scan_track     <= 0;
-	end else begin
-		if (sd_state) begin
-			if(old_ack && ~sd_ack) begin
-				sd_state <= 0;
-			end
-		end
-
+	end else if (~fsm_hold) begin
 		// =====================================================================
 		// Main DMA Control FSM
 		// =====================================================================
@@ -504,6 +538,15 @@ always @(posedge clk) begin
 
 		endcase
 	end
+
+	// a load restored the state of another image: reload the track from the
+	// mounted one and drop a write-back still in the synchronizer
+	if (remount) begin
+		update <= 1;
+		{sv_s1, sv_s2, save_track_s, old_save_track} <= {4{save_track}};
 	end
+	if (ss_en) {save_track_s, sv_s2, sv_s1, track_s, trk_s2, trk_s1, old_save_track, update, track_new,
+	            cur_track, cur_track_offset} <= ss_d;
+end
 
 endmodule

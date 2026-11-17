@@ -128,7 +128,7 @@ module iecdrv_bitmem64 #(parameter ADDRWIDTH)
 	input	                     clock_a,
 	input	     [ADDRWIDTH-1:0] address_a,
 	input	              [63:0] data_a,
-	input	                     wren_a,
+	input	               [7:0] wren_a,   // per byte lane
 	output wire          [63:0] q_a,
 
 	input	                     clock_b,
@@ -148,7 +148,7 @@ generate
 			.clock_a(clock_a),
 			.address_a(address_a),
 			.data_a(data_a[i*8 +: 8]),
-			.wren_a(wren_a),
+			.wren_a(wren_a[i]),
 			.q_a(q_a_bytes[i]),
 
 			.clock_b(clock_b),

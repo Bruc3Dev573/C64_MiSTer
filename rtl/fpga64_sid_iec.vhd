@@ -78,6 +78,11 @@ port(
 	r           : out unsigned(7 downto 0);
 	g           : out unsigned(7 downto 0);
 	b           : out unsigned(7 downto 0);
+	-- VIC color index of r/g/b (same timing), for the pause frame buffer
+	color_index : out unsigned(3 downto 0);
+	-- VIC raster position (X, line), for the output sync alignment (c64.sv video_sync)
+	vic_x       : out unsigned(9 downto 0);
+	vic_y       : out unsigned(8 downto 0);
 
 	-- cartridge port
 	game        : in  std_logic;
@@ -163,7 +168,27 @@ port(
 	cass_motor  : out std_logic;
 	cass_write  : out std_logic;
 	cass_sense  : in  std_logic;
-	cass_read   : in  std_logic
+	cass_read   : in  std_logic;
+
+	-- savestate (WP A2)
+	ss_cpu_sync : out std_logic;  -- next CPU cycle is an opcode fetch: instruction boundary
+	ss_cram_act : in  std_logic := '0';  -- engine owns the Color RAM port (only while paused)
+	ss_cram_addr: in  unsigned(9 downto 0) := (others => '0');
+	ss_cram_we  : in  std_logic := '0';
+	ss_cram_din : in  unsigned(3 downto 0) := (others => '0');
+	ss_cram_q   : out unsigned(3 downto 0);
+
+	-- savestate scan chain (WP A3-A7): segments CPU, VIC, CIA1, CIA2, SID1, SID2 and SYS, docs/SAVESTATES.md.
+	-- ss_chain_si comes from the engine (chain_so), ss_chain_so goes back to it.
+	-- Between SYS and SID2 the chain leaves the instance (ss_ext_so) for the
+	-- segments of c64.sv (REU, ...) and comes back on ss_ext_si.
+	ss_chain_en  : in  std_logic := '0';
+	ss_hold      : in  std_logic := '0';  -- the engine owns the stopped machine
+	ss_load_done : in  std_logic := '0';
+	ss_chain_si  : in  std_logic := '0';
+	ss_chain_so  : out std_logic;
+	ss_ext_so    : out std_logic;
+	ss_ext_si    : in  std_logic := '0'
 );
 end fpga64_sid_iec;
 
@@ -183,6 +208,10 @@ type sysCycleDef is (
 );
 
 signal sysCycle     : sysCycleDef := sysCycleDef'low;
+signal ss_cram_own  : std_logic;
+signal cram_we      : std_logic;
+signal cram_addr    : unsigned(9 downto 0);
+signal cram_data    : unsigned(3 downto 0);
 signal preCycle     : sysCycleDef := sysCycleDef'low;
 signal sysEnable    : std_logic;
 signal rfsh_cycle   : unsigned(1 downto 0);
@@ -245,12 +274,30 @@ signal cia1_pao     : unsigned(7 downto 0);
 signal cia1_pbi     : unsigned(7 downto 0);
 signal cia1_pbo     : unsigned(7 downto 0);
 signal cia2_pai     : unsigned(7 downto 0);
+-- IEC DATA/CLK input latch (cia2_pai(7 downto 6)); a named signal so the
+-- savestate inventory sees it as cia2_pai_iec instead of an anonymous net
+signal cia2_pai_iec : unsigned(7 downto 6);
 signal cia2_pao     : unsigned(7 downto 0);
 signal cia2_pbi     : unsigned(7 downto 0);
 signal cia2_pbo     : unsigned(7 downto 0);
 signal cia2_pbe     : unsigned(7 downto 0);
 
 signal todclk       : std_logic;
+signal tod_sum      : unsigned(24 downto 0);
+
+-- savestate segment SYS: tod_sum, cia2_pai_iec, dma_active, lastVicDi,
+-- ss_todclk, turbo_en, turbo_m, vicAddr1514, vicBus here (bit 0 leaves
+-- first), then the KERNAL select of buslogic. The cycle grid registers
+-- (preCycle, sysEnable, enables, ...) are not saved: savestate/state_classes.yaml.
+signal sys_q, sys_d : std_logic_vector(50 downto 0);
+signal ss_todclk    : std_logic;
+signal ss_bl_so     : std_logic;
+signal ss_sys_so    : std_logic;
+signal ss_cia1_so   : std_logic;   -- chain: SYS -> (ss_ext_so ... ss_ext_si) -> SID2 -> SID1 -> CIA2 -> CIA1 -> VIC -> CPU
+signal ss_sid_so    : std_logic;
+signal sid_hold     : std_logic;   -- machine stopped (pause or savestate freeze): SID pipeline holds
+signal ss_cia2_so   : std_logic;
+signal ss_vic_so    : std_logic;
 
 -- video
 signal vicColorIndex: unsigned(3 downto 0);
@@ -308,7 +355,12 @@ component sid_top
 		ld_clk        : in  std_logic;
 		ld_addr       : in  std_logic_vector(11 downto 0);
 		ld_data       : in  std_logic_vector(15 downto 0);
-		ld_wr         : in  std_logic
+		ld_wr         : in  std_logic;
+
+		ss_en         : in  std_logic;
+		stop          : in  std_logic;
+		ss_si         : in  std_logic;
+		ss_so         : out std_logic
   );
 end component;
 
@@ -337,7 +389,12 @@ component mos6526
 		sp_out        : out std_logic;
 		cnt_in        : in  std_logic;
 		cnt_out       : out std_logic;
-		irq_n         : out std_logic
+		irq_n         : out std_logic;
+		ss_en         : in  std_logic;
+		ss_hold       : in  std_logic;
+		ss_load_done  : in  std_logic;
+		ss_si         : in  std_logic;
+		ss_so         : out std_logic
 	);
 end component; 
 
@@ -358,6 +415,7 @@ io_cycle <= '1' when
 
 sysCycle <= preCycle when sysEnable = '1' else CYCLE_EXT4;
 pause_out <= not sysEnable;
+sid_hold  <= not sysEnable;
 
 process(clk32)
 begin
@@ -431,6 +489,13 @@ end process;
 -- -----------------------------------------------------------------------
 -- Color RAM
 -- -----------------------------------------------------------------------
+-- The savestate engine borrows the port while the machine is stopped.
+ss_cram_own <= ss_cram_act and not sysEnable;
+cram_we   <= ss_cram_we   when ss_cram_own = '1' else cs_color and pulseWr_io;
+cram_addr <= ss_cram_addr when ss_cram_own = '1' else systemAddr(9 downto 0);
+cram_data <= ss_cram_din  when ss_cram_own = '1' else cpuDo(3 downto 0);
+ss_cram_q <= colorData;
+
 colorram: entity work.spram
 generic map (
 	DATA_WIDTH => 4,
@@ -438,9 +503,9 @@ generic map (
 )
 port map (
 	clk => clk32,
-	we => cs_color and pulseWr_io,
-	addr => systemAddr(9 downto 0),
-	data => cpuDo(3 downto 0),
+	we => cram_we,
+	addr => cram_addr,
+	data => cram_data,
 	q => colorData
 );
 
@@ -498,7 +563,11 @@ port map (
 
 	c64rom_addr => c64rom_addr,
 	c64rom_data => c64rom_data,
-	c64rom_wr => c64rom_wr
+	c64rom_wr => c64rom_wr,
+
+	ss_en => ss_chain_en,
+	ss_si => ss_chain_si,
+	ss_so => ss_bl_so
 );
 
 IOE <= ioe_i;
@@ -529,6 +598,9 @@ begin
 			else
 				vicBus <= x"FF";
 			end if;
+		end if;
+		if ss_chain_en = '1' then
+			vicBus <= unsigned(sys_d(50 downto 43));
 		end if;
 	end if;
 end process;
@@ -582,9 +654,18 @@ port map (
 	hsync => hSync,
 	vsync => vSync,
 	colorIndex => vicColorIndex,
+	rasterXpos => vic_x,
+	rasterYpos => vic_y,
 
-	irq_n => irq_vic
+	irq_n => irq_vic,
+
+	ss_en => ss_chain_en,
+	ss_hold => ss_hold,
+	ss_si => ss_cia1_so,
+	ss_so => ss_vic_so
 );
+
+color_index <= vicColorIndex;
 
 c64colors: entity work.fpga64_rgbcolor
 port map (
@@ -600,6 +681,9 @@ begin
 	if rising_edge(clk32) then
 		if sysCycle = CYCLE_VIC3 then
 			lastVicDi <= vicDi;
+		end if;
+		if ss_chain_en = '1' then
+			lastVicDi <= unsigned(sys_d(35 downto 28));
 		end if;
 	end if;
 end process;
@@ -617,6 +701,9 @@ begin
 	if rising_edge(clk32) then
 		if phi0_cpu = '0' and enableVic = '1' then
 			vicAddr1514 <= not cia2_pao(1 downto 0);
+		end if;
+		if ss_chain_en = '1' then
+			vicAddr1514 <= unsigned(sys_d(42 downto 41));
 		end if;
 	end if;
 end process;
@@ -689,7 +776,12 @@ port map (
 	ld_clk  => sid_ld_clk,
 	ld_addr => sid_ld_addr,
 	ld_data => sid_ld_data,
-	ld_wr   => sid_ld_wr
+	ld_wr   => sid_ld_wr,
+
+	ss_en   => ss_chain_en,
+	stop    => sid_hold,
+	ss_si   => ss_ext_si,
+	ss_so   => ss_sid_so
 );
 
 -- -----------------------------------------------------------------------
@@ -722,7 +814,13 @@ port map (
 
 	tod => todclk,
 
-	irq_n => irq_cia1
+	irq_n => irq_cia1,
+
+	ss_en => ss_chain_en,
+	ss_hold => ss_hold,
+	ss_load_done => ss_load_done,
+	ss_si => ss_cia2_so,
+	ss_so => ss_cia1_so
 );
 
 cia2: mos6526
@@ -755,20 +853,29 @@ port map (
 
 	tod => todclk,
 
-	irq_n => irq_cia2
+	irq_n => irq_cia2,
+
+	ss_en => ss_chain_en,
+	ss_hold => ss_hold,
+	ss_load_done => ss_load_done,
+	ss_si => ss_sid_so,
+	ss_so => ss_cia2_so
 );
 
 serialBus: process(clk32)
 begin
 	if rising_edge(clk32) then
 		if sysCycle = CYCLE_EXT5 then
-			cia2_pai(7) <= iec_data_i and not cia2_pao(5);
-			cia2_pai(6) <= iec_clk_i and not cia2_pao(4);
+			cia2_pai_iec(7) <= iec_data_i and not cia2_pao(5);
+			cia2_pai_iec(6) <= iec_clk_i and not cia2_pao(4);
+		end if;
+		if ss_chain_en = '1' then
+			cia2_pai_iec <= unsigned(sys_d(26 downto 25));
 		end if;
 	end if;
 end process;
 
-cia2_pai(5 downto 0) <= "111" & pa2_i & "11";
+cia2_pai <= cia2_pai_iec & "111" & pa2_i & "11";
 
 iec_data_o <= not cia2_pao(5);
 iec_clk_o  <= not cia2_pao(4);
@@ -778,12 +885,17 @@ pb_o  <= cia2_pbo;
 pa2_o <= cia2_pao(2);
 
 process(clk32)
-variable sum: integer range 0 to 33000000;
+variable sum: unsigned(24 downto 0);
 begin
 	if rising_edge(clk32) then
+		sum := tod_sum;
 		if reset = '1' then
 			todclk <= '0';
-			sum := 0;
+			sum := (others => '0');
+		elsif sysEnable = '0' then
+			-- paused: the 50/60 Hz TOD source must not advance, otherwise the
+			-- CIAs miss TOD edges and drift against the CPU after resume.
+			null;
 		elsif ntscMode = '1' then
 			sum := sum + 120;
 			if sum >= 32727266 then
@@ -797,8 +909,28 @@ begin
 				todclk <= not todclk;
 			end if;
 		end if;
+		tod_sum <= sum;
+
+		-- todclk feeds the CIA TOD inputs, sampled on every clock: it never
+		-- shifts. The chain carries ss_todclk, its copy taken until the engine
+		-- holds the machine, written back on ss_load_done.
+		if ss_chain_en = '1' then
+			tod_sum   <= unsigned(sys_d(24 downto 0));
+			ss_todclk <= sys_d(36);
+		elsif ss_hold = '0' then
+			ss_todclk <= todclk;
+		end if;
+		if ss_load_done = '1' then
+			todclk <= ss_todclk;
+		end if;
 	end if;
 end process;
+
+sys_q <= std_logic_vector(vicBus) & std_logic_vector(vicAddr1514) & turbo_m & turbo_en & ss_todclk &
+         std_logic_vector(lastVicDi) & dma_active & std_logic_vector(cia2_pai_iec) & std_logic_vector(tod_sum);
+sys_d <= ss_bl_so & sys_q(50 downto 1);
+ss_sys_so <= sys_q(0);
+ss_ext_so <= ss_sys_so;
 
 -- -----------------------------------------------------------------------
 -- 6510 CPU / DMA
@@ -819,7 +951,14 @@ port map (
 	we => cpuWe_pre,
 
 	diIO => cpuIO(7) & cpuIO(6) & cpuIO(5) & cass_sense & cpuIO(3) & "111",
-	doIO => cpuIO
+	doIO => cpuIO,
+	sync => ss_cpu_sync,
+
+	ss_en => ss_chain_en,
+	ss_hold => ss_hold,
+	ss_load_done => ss_load_done,
+	ss_si => ss_vic_so,
+	ss_so => ss_chain_so
 );
 
 cass_motor <= cpuIO(5);
@@ -859,6 +998,11 @@ begin
 					when "11" => turbo_m <= "111"; -- unused
 				end case;
 			end if;
+		end if;
+		if ss_chain_en = '1' then
+			dma_active <= sys_d(27);
+			turbo_en   <= sys_d(37);
+			turbo_m    <= sys_d(40 downto 38);
 		end if;
 	end if;
 end process;

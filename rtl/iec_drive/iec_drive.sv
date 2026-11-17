@@ -69,7 +69,26 @@ module iec_drive #(parameter PARPORT=1,DUALROM=1,DRIVES=2)
 	output        DDRAM_RD,
 	output        DDRAM_WE,
 	output [63:0] DDRAM_DIN,
-	output  [7:0] DDRAM_BE
+	output  [7:0] DDRAM_BE,
+
+	// savestate (WP A8, A10): chain ss_si -> 1581 units (segments DRV9_1581,
+	// DRV8_1581) -> 1541 units (DRV9_1541, DRV8_1541) -> ss_so, the regions
+	// of all units on one byte bus
+	input         ss_en,
+	input         ss_hold,
+	input         ss_load_done,
+	input         ss_si,
+	output        ss_so,
+	output        ss_idle,       // drive CPUs between instructions, no track or sector transfer starting
+	output  [N:0] ss_1581,       // drive type per unit (config mask): 1 = 1581
+	input [3*NDR-1:0] ss_rgn_sel,    // 1541 unit i: [3*i +: 3] = {TRACK, EXTRAM, RAM}
+	input [2*NDR-1:0] ss_rgn_sel81,  // 1581 unit i: [2*i +: 2] = {FDC_BUF, RAM}
+	input  [12:0] ss_rgn_addr,
+	input         ss_rgn_req,
+	input         ss_rgn_we,
+	input   [7:0] ss_rgn_wdata,
+	output  [7:0] ss_rgn_rdata,
+	output        ss_rgn_ack
 	);
 
 localparam NDR = (DRIVES < 1) ? 1 : (DRIVES > 4) ? 4 : DRIVES;
@@ -77,6 +96,13 @@ localparam N   = NDR - 1;
 
 reg [N:0] dtype[2];
 always @(posedge clk_sys) for(int i=0; i<NDR; i=i+1) if(img_mounted[i] && img_size) {dtype[1][i],dtype[0][i]} <= img_type;
+assign ss_1581 = dtype[1];
+
+wire       ss_81_so, ss_81_idle, ss_41_idle, ss_81_ack, ss_41_ack;
+wire [7:0] ss_81_rdata, ss_41_rdata;
+assign ss_idle      = ss_41_idle & ss_81_idle;
+assign ss_rgn_ack   = ss_41_ack | ss_81_ack;
+assign ss_rgn_rdata = ss_81_ack ? ss_81_rdata : ss_41_rdata;
 
 assign led          = c1581_led       | c1541_led;
 assign iec_data_o   = c1581_iec_data  & c1541_iec_data;
@@ -167,7 +193,21 @@ c1541_multi #(.PARPORT(PARPORT), .DUALROM(DUALROM), .DRIVES(DRIVES)) c1541
 	.DDRAM_RD(DDRAM_RD),
 	.DDRAM_WE(DDRAM_WE),
 	.DDRAM_DIN(DDRAM_DIN),
-	.DDRAM_BE(DDRAM_BE)
+	.DDRAM_BE(DDRAM_BE),
+
+	.ss_en(ss_en),
+	.ss_hold(ss_hold),
+	.ss_load_done(ss_load_done),
+	.ss_si(ss_81_so),
+	.ss_so(ss_so),
+	.ss_idle(ss_41_idle),
+	.ss_rgn_sel(ss_rgn_sel),
+	.ss_rgn_addr(ss_rgn_addr),
+	.ss_rgn_req(ss_rgn_req),
+	.ss_rgn_we(ss_rgn_we),
+	.ss_rgn_wdata(ss_rgn_wdata),
+	.ss_rgn_rdata(ss_41_rdata),
+	.ss_rgn_ack(ss_41_ack)
 	);
 
 
@@ -219,7 +259,21 @@ c1581_multi #(.PARPORT(PARPORT), .DUALROM(DUALROM), .DRIVES(DRIVES)) c1581
 	.sd_buff_addr(sd_buff_addr[8:0]),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(c1581_sd_buff_dout),
-	.sd_buff_wr(sd_buff_wr)
+	.sd_buff_wr(sd_buff_wr),
+
+	.ss_en(ss_en),
+	.ss_hold(ss_hold),
+	.ss_load_done(ss_load_done),
+	.ss_si(ss_si),
+	.ss_so(ss_81_so),
+	.ss_idle(ss_81_idle),
+	.ss_rgn_sel(ss_rgn_sel81),
+	.ss_rgn_addr(ss_rgn_addr),
+	.ss_rgn_req(ss_rgn_req),
+	.ss_rgn_we(ss_rgn_we),
+	.ss_rgn_wdata(ss_rgn_wdata),
+	.ss_rgn_rdata(ss_81_rdata),
+	.ss_rgn_ack(ss_81_ack)
 );
 
 endmodule

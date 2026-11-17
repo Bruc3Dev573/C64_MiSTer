@@ -35,13 +35,12 @@ wire        drv_ddram_we;
 wire [63:0] drv_ddram_din;
 wire [7:0]  drv_ddram_be;
 
+wire        drv_ddram_busy;
+wire        drv_ddram_ready;
+
+// DDRAM_* are driven by the savestate arbiter (ss_ddram_arb, see savestates
+// section): the drive track cache owns the port except during a savestate.
 assign DDRAM_CLK      = clk_sys;
-assign DDRAM_BURSTCNT = drv_ddram_burstcnt;
-assign DDRAM_ADDR     = drv_ddram_addr;
-assign DDRAM_RD       = drv_ddram_rd;
-assign DDRAM_WE       = drv_ddram_we;
-assign DDRAM_DIN      = drv_ddram_din;
-assign DDRAM_BE       = drv_ddram_be;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
 assign LED_DISK   = 0;
@@ -66,15 +65,18 @@ assign HDMI_BOB_DEINT = 0;
 // XXXXXXXXXXXXXXXXXXXXXXXXX  XXXXX
 //                            ^^^^^ 91=Counter Reset, 92=Counter,
 //                                  93=Rewind, 94=Fast Forward, 95=Stop
+//                                     ^^^^^^ 99=Savestates to SD, 101:100=Slot,
+//                                            102=Save, 103=Restore, 104=Self-test
 
 `include "build_id.v"
 localparam CONF_STR = {
-	"C64;UART9600:2400;",
+	// Main reads the SS (savestate area) and UART tokens only from this second field, comma separated
+	"C64;SS3E000000:800000,UART9600:2400;",
 	"H7S0,D64G64T64D81,Mount #8;",
 	"H0S1,D64G64T64D81,Mount #9;",
 	"O[77:76],Mount Write Protected,Off,#8,#9,#8 & #9;",
 	"-;",
-	"F1,PRGCRTREUTAP;",
+	"FS1,PRGCRTREUTAP;",
 	"hAdBR[61],Save cartridge;",
 	"hAO[62],Autosave,Off,On;",
 	"h3-;",
@@ -155,6 +157,12 @@ localparam CONF_STR = {
 	"P3R[6],Reset Disk Drives;",
 
 	"-;",
+	"O[99],Savestates to SDCard,On,Off;",
+	"O[101:100],Savestate Slot,1,2,3,4;",
+	"R[102],Save state (Pad SS+Down);",
+	"R[103],Restore state (Pad SS+Up);",
+	"R[104],Savestate self-test;",
+	"-;",
 	"O[3],Swap Joysticks,No,Yes;",
 	"O[88:87],SNAC Joystick,Disabled,Joy 1,Joy 2;",
 	"-;",
@@ -163,9 +171,35 @@ localparam CONF_STR = {
 	"-;",
 	"R[0],Reset;",
 	"R[17],Reset & Detach Cartridge;",
-	"J,Fire 1,Fire 2,Fire 3,Paddle Btn,Mod1,Mod2;",
-	"jn,A,B,Y,X|P,R,L;",
-	"jp,A,B,Y,X|P,R,L;",
+	// Savestate info messages (savestate_ui.sv): help, slots, saved/restored,
+	// engine refusals (13 + result code), self-test.
+	"I,",
+	"Slot=Ctrl+Alt+F1-F4/SS+L/R|Save=SS+Down|Load=SS+Up,",
+	"Active Slot 1,",
+	"Active Slot 2,",
+	"Active Slot 3,",
+	"Active Slot 4,",
+	"Save to state 1,",
+	"Restore state 1,",
+	"Save to state 2,",
+	"Restore state 2,",
+	"Save to state 3,",
+	"Restore state 3,",
+	"Save to state 4,",
+	"Restore state 4,",
+	"Savestate: no safe point - not saved,",
+	"Savestate: REU too large for the slot,",
+	"Savestate: slot empty or invalid,",
+	"Savestate: other core version,",
+	"Savestate: other hardware settings,",
+	"Savestate: slot damaged (CRC),",
+	"Savestate: busy - try again,",
+	"Savestate: DDR3/RAM timeout,",
+	"Savestate self-test: PASS,",
+	"Savestate self-test: FAIL;",
+	"J,Fire 1,Fire 2,Fire 3,Paddle Btn,Mod1,Mod2,Savestates;",
+	"jn,A,B,Y,X|P,R,L,Select;",
+	"jp,A,B,Y,X|P,R,L,Select;",
 	"V,v",`BUILD_DATE
 };
 
@@ -316,6 +350,62 @@ end
 wire [15:0] joyA,joyB,joyC,joyD;
 wire [15:0] joy = joyA | joyB | joyC | joyD;
 
+// pad "Savestates" button (joy[10]) is a modifier: the C64 does not see the
+// joysticks while it is held and for ~10 ms after (savestate_ui)
+reg  [19:0] ss_combo_tail = 0;
+wire        ss_combo_hold = joy[10] | (ss_combo_tail != 0);
+always @(posedge clk_sys) begin
+	if (joy[10]) ss_combo_tail <= 20'd320000;
+	else if (ss_combo_tail != 0) ss_combo_tail <= ss_combo_tail - 1'd1;
+end
+
+wire        c64_pause;      // machine actually stopped (pause_out of fpga64, cycle aligned)
+wire        c64_pause_in;   // pause input of fpga64 (freeze, held until the sync realigns)
+wire        ss_freeze_req;  // savestate engine holds the machine (ss_freeze)
+
+// savestates (WP A2): signals used before the savestate section
+wire        ss_pause;       // pause input of fpga64 (OSD pause or savestate freeze)
+wire        ss_frz_ack;     // machine frozen for the savestate engine
+wire        c64_cpu_sync;   // C64 CPU between instructions
+wire        ss_kbd_eat;     // ps2_key event is a savestate hotkey
+wire        ss_load_done;   // 1 clock after a savestate load
+wire        ss_chain_en, ss_chain_so, ss_chain_si;   // scan chain (engine <-> segments)
+wire        ss_ext_so, ss_ext_si;                    // chain leg outside fpga64: SYS -> OPL3 -> 1541 x2 -> INPUT -> CART -> REU -> SID2
+wire        ss_opl_so;                               // OPL3: ss_ext_so (SYS) -> OPL3 -> DRV9_1541
+wire        ss_opl_replay;                           // OPL3 reset and replay after a load: machine held
+wire  [7:0] ss_opl_rgn_rdata;                        // OPL3_REGS region port
+wire        ss_opl_rgn_ack;
+wire        ss_cart_so, ss_dmax_so;                  // CART: cartridge.v, then the DigiMax registers
+wire        ss_rtc_so;                               // engine chain_so -> TAPE -> RTC -> TOP -> fpga64 ss_chain_si
+wire        ss_tape_so, ss_tapess_so;                // TAPE: tape_subsystem, then the use_tape glue
+wire        ss_input_so;                             // INPUT (1351 mouse): DRV8_1541 -> mouse -> CART
+wire        ss_top_so;                               // TOP (drive_ce, disk activity): RTC -> TOP -> fpga64
+wire        ss_drv_so;                               // drives: OPL3 -> DRV9_1581 -> DRV8_1581 -> DRV9_1541 -> DRV8_1541 -> INPUT
+wire        ss_drv_idle;                             // drive CPUs between instructions, no track/sector transfer starting
+wire  [1:0] ss_drv_1581;                             // drive type per unit (config mask)
+wire  [5:0] ss_drv_rgn_sel;                          // 1541: {TRACK, EXTRAM, RAM} of unit 9, then of unit 8
+wire  [3:0] ss_drv_rgn_sel81;                        // 1581: {FDC_BUF, RAM} of unit 9, then of unit 8
+wire  [7:0] ss_drv_rgn_rdata;
+wire        ss_drv_rgn_ack;
+wire  [7:0] ss_rgn_tag, ss_rgn_wdata;               // engine region bus (savestates section)
+wire [23:0] ss_rgn_addr;
+wire        ss_rgn_req, ss_rgn_we;
+wire  [7:0] ss_rgn_rdata;
+wire        ss_rgn_ack;
+wire  [1:0] ss_slot;
+wire        ss_status_upd;
+wire        ss_info_req;
+wire  [7:0] ss_info;
+wire        tape_ss_idle;
+wire        ss_sd_own, ss_sd_ce, ss_sd_we;
+wire [24:0] ss_sd_addr;
+wire  [7:0] ss_sd_din;
+reg         ss_cram_act = 0;
+reg         ss_cram_we = 0;
+reg   [9:0] ss_cram_addr = 0;
+reg   [3:0] ss_cram_din = 0;
+wire  [3:0] ss_cram_q;
+
 wire [127:0] status;
 wire        forced_scandoubler;
 
@@ -374,6 +464,10 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(2), .BLKSZ(1)) hps_io
 	.paddle_3(pd4),
 
 	.status(status),
+	.status_in({status[127:102], ss_slot, status[99:0]}),
+	.status_set(ss_status_upd),
+	.info_req(ss_info_req),
+	.info(ss_info),
 	.status_menumask({status[54], ezfl_mod || ezfl_save_en, cart_ezfl, ~status[69], ~status[66], status[58], |status[47:46], status[16], status[13], tap_loaded, 1'b0, |vcrop, status[56]}), .buttons(buttons),
 	.forced_scandoubler(forced_scandoubler),
 	.gamma_bus(gamma_bus),
@@ -436,6 +530,7 @@ cartridge cartridge
 (
 	.clk32(clk_sys),
 	.reset_n(reset_n),
+	.pause(c64_pause),
 
 	.cart_loading(ioctl_download && load_crt),
 	.cart_id(cart_attached ? cart_id : status[52] ? 8'd99 : 8'd255),
@@ -475,7 +570,13 @@ cartridge cartridge
 	.freeze_key(freeze_key),
 	.mod_key(mod_key),
 	.nmi(nmi),
-	.nmi_ack(nmi_ack)
+	.nmi_ack(nmi_ack),
+
+	.ss_en(ss_chain_en),
+	.ss_hold(ss_frz_ack),
+	.ss_load_done(ss_load_done),
+	.ss_si(ss_input_so),
+	.ss_so(ss_cart_so)
 );
 
 wire ezfl_save = status[61] | (status[62] & OSD_STATUS & ezfl_mod);
@@ -542,8 +643,15 @@ reu reu
 	.cpu_din(reu_dout),
 	.cpu_we(ram_we),
 	.cpu_cs(IOF),
-	
-	.irq(reu_irq)
+
+	.irq(reu_irq),
+
+	.ss_en(ss_chain_en),
+	.stop(c64_pause),             // machine stopped: OSD pause or savestate freeze
+	.ss_hold(ss_frz_ack),
+	.ss_load_done(ss_load_done),
+	.ss_si(ss_dmax_so),
+	.ss_so(ss_ext_si)
 );
 
 reg ext_cycle_d;
@@ -551,10 +659,11 @@ always @(posedge clk_sys) ext_cycle_d <= ext_cycle;
 wire reu_ram_ce = ~ext_cycle_d & ext_cycle & dma_req;
 
 // rearrange joystick contacts for c64
-wire [6:0] joyA_int = joy[8] ? 7'd0 : {joyA[6:4], joyA[0], joyA[1], joyA[2], joyA[3]};
-wire [6:0] joyB_int = joy[8] ? 7'd0 : {joyB[6:4], joyB[0], joyB[1], joyB[2], joyB[3]};
-wire [6:0] joyC_c64 = joy[8] ? 7'd0 : {joyC[6:4], joyC[0], joyC[1], joyC[2], joyC[3]};
-wire [6:0] joyD_c64 = joy[8] ? 7'd0 : {joyD[6:4], joyD[0], joyD[1], joyD[2], joyD[3]};
+// (the pad Savestates button masks the C64 joysticks while held, plus ~10 ms)
+wire [6:0] joyA_int = (joy[8] | ss_combo_hold) ? 7'd0 : {joyA[6:4], joyA[0], joyA[1], joyA[2], joyA[3]};
+wire [6:0] joyB_int = (joy[8] | ss_combo_hold) ? 7'd0 : {joyB[6:4], joyB[0], joyB[1], joyB[2], joyB[3]};
+wire [6:0] joyC_c64 = (joy[8] | ss_combo_hold) ? 7'd0 : {joyC[6:4], joyC[0], joyC[1], joyC[2], joyC[3]};
+wire [6:0] joyD_c64 = (joy[8] | ss_combo_hold) ? 7'd0 : {joyD[6:4], joyD[0], joyD[1], joyD[2], joyD[3]};
 
 // swap joysticks if requested
 // SNAC DB9 joystick support - C64/Amiga/SMS standard pinout:
@@ -795,6 +904,12 @@ end
 reg        start_strk = 0;
 reg        reset_keys = 0;
 reg [10:0] key = 0;
+// A savestate hotkey (Ctrl+Alt+F1..F4) is eaten: its strobe toggle is undone
+// by kbd_par, so the C64 keyboard never sees the event.
+reg        kbd_par = 0;
+wire       kbd_par_next = kbd_par ^ ss_kbd_eat;
+wire       kbd_stb = ps2_key[10] ^ kbd_par_next;
+always @(posedge clk_sys) kbd_par <= kbd_par_next;
 always @(posedge clk_sys) begin
 	reg  [3:0] act = 0;
 	reg        joy_finish = 0;
@@ -843,7 +958,7 @@ always @(posedge clk_sys) begin
 	else if(joy_finish) begin
 		joy_last   <= 0;
 		key        <= 0;
-		key[10]    <= ps2_key[10];
+		key[10]    <= kbd_stb;
 		joy_finish <= 0;
 		reset_keys <= 1;
 	end
@@ -862,12 +977,12 @@ always @(posedge clk_sys) begin
 				10: act <= 0;
 			endcase
 			key[9]  <= act[0];
-			key[10] <= (act >= 9) ? ps2_key[10] : ~key[10];
+			key[10] <= (act >= 9) ? kbd_stb : ~key[10];
 		end
 	end
 	else begin
 		to <= 0;
-		key <= {ps2_key[10], ps2_key[9] & disk_ready, ps2_key[8:0]};
+		key <= {kbd_stb, ps2_key[9] & disk_ready, ps2_key[8:0]};
 	end
 	if(start_strk & ~status[50]) begin
 		act <= 1;
@@ -893,17 +1008,16 @@ sdram sdram
 	.clk(clk64),
 	.init(~pll_locked),
 	.refresh(refresh),
-	.addr( io_cycle ? (cart_mem_req ? cart_addr   : io_cycle_addr ) : ext_cycle ? reu_ram_addr : cart_addr   ),
-	.ce  ( io_cycle ? (cart_mem_req ? cart_ce     : io_cycle_ce   ) : ext_cycle ? reu_ram_ce   : cart_ce     ),
-	.we  ( io_cycle ? (cart_mem_req ? cart_we     : io_cycle_we   ) : ext_cycle ? reu_ram_we   : cart_we     ),
-	.din ( io_cycle ? (cart_mem_req ? cart_wrdata : io_cycle_data ) : ext_cycle ? reu_ram_dout : cart_wrdata ),
+	.addr( ss_sd_own ? ss_sd_addr : io_cycle ? (cart_mem_req ? cart_addr   : io_cycle_addr ) : ext_cycle ? reu_ram_addr : cart_addr   ),
+	.ce  ( ss_sd_own ? ss_sd_ce   : io_cycle ? (cart_mem_req ? cart_ce     : io_cycle_ce   ) : ext_cycle ? reu_ram_ce   : cart_ce     ),
+	.we  ( ss_sd_own ? ss_sd_we   : io_cycle ? (cart_mem_req ? cart_we     : io_cycle_we   ) : ext_cycle ? reu_ram_we   : cart_we     ),
+	.din ( ss_sd_own ? ss_sd_din  : io_cycle ? (cart_mem_req ? cart_wrdata : io_cycle_data ) : ext_cycle ? reu_ram_dout : cart_wrdata ),
 	.dout( sdram_data )
 );
 
 wire  [7:0] c64_data_out;
 wire  [7:0] c64_data_in;
 wire [15:0] c64_addr;
-wire        c64_pause;
 wire        refresh;
 wire        ram_ce;
 wire        ram_we;
@@ -919,6 +1033,9 @@ wire        UMAXromH;
 
 wire [17:0] audio_l,audio_r;
 wire  [7:0] r,g,b;
+wire  [3:0] vic_idx;
+wire  [9:0] vic_x;   // VIC raster position, for the output sync alignment (video_sync)
+wire  [8:0] vic_y;
 
 wire        ntsc_req = status[2];
 
@@ -926,7 +1043,7 @@ fpga64_sid_iec fpga64
 (
 	.clk32(clk_sys),
 	.reset_n(reset_n),
-	.pause(freeze),
+	.pause(ss_pause),
 	.pause_out(c64_pause),
 	.bios(status[15:14]),
 	
@@ -934,7 +1051,7 @@ fpga64_sid_iec fpga64
 	.turbo_speed(status[49:48]),
 
 	.ps2_key(key),
-	.kbd_reset((~reset_n & ~status[1]) | reset_keys),
+	.kbd_reset((~reset_n & ~status[1]) | reset_keys | ss_load_done),   // D3: no stuck keys after a savestate load
 	.shift_mod(~status[60:59]),
 
 	.ramAddr(c64_addr),
@@ -951,6 +1068,9 @@ fpga64_sid_iec fpga64
 	.r(r),
 	.g(g),
 	.b(b),
+	.color_index(vic_idx),
+	.vic_x(vic_x),
+	.vic_y(vic_y),
 
 	.game(game),
 	.exrom(exrom),
@@ -1037,7 +1157,25 @@ fpga64_sid_iec fpga64
 	.cass_write(cass_write),
 	.cass_motor(cass_motor),
 	.cass_sense(~tape_adc_act & (use_tape ? cass_sense : cass_rtc)),
-	.cass_read(tape_adc_act ? ~tape_adc : cass_read)
+	.cass_read(tape_adc_act ? ~tape_adc : cass_read),
+
+	.ss_cpu_sync(c64_cpu_sync),
+	.ss_cram_act(ss_cram_act),
+	.ss_cram_addr(ss_cram_addr),
+	.ss_cram_we(ss_cram_we),
+	.ss_cram_din(ss_cram_din),
+	.ss_cram_q(ss_cram_q),
+
+	// segments SYS (first in, after TOP of c64.sv), SID2, SID1, CIA2, CIA1,
+	// VIC and CPU (last, out to the engine); between SYS and SID2 the chain
+	// leaves through ss_ext_so and comes back on ss_ext_si (1541 x2, INPUT, CART, REU here)
+	.ss_chain_en(ss_chain_en),
+	.ss_hold(ss_frz_ack),
+	.ss_load_done(ss_load_done),
+	.ss_chain_si(ss_top_so),
+	.ss_chain_so(ss_chain_si),
+	.ss_ext_so(ss_ext_so),
+	.ss_ext_si(ss_ext_si)
 );
 
 wire [7:0] mouse_x;
@@ -1053,7 +1191,14 @@ c1351 mouse
 	
 	.potX(mouse_x),
 	.potY(mouse_y),
-	.button(mouse_btn)
+	.button(mouse_btn),
+
+	// segment INPUT: DRV8_1541 (iec_drive) -> INPUT -> CART
+	.stop(c64_pause),
+	.ss_en(ss_chain_en),
+	.ss_hold(ss_frz_ack),
+	.ss_si(ss_drv_so),
+	.ss_so(ss_input_so)
 );
 
 wire       c64_iec_clk;
@@ -1142,52 +1287,94 @@ iec_drive iec_drive
 	.rom_wr(((load_rom && ioctl_addr[16:14]) || load_c1581) && ioctl_download && ioctl_wr),
 	.rom_std(status[14]),
 
-	.DDRAM_BUSY(DDRAM_BUSY),
+	.DDRAM_BUSY(drv_ddram_busy),
 	.DDRAM_BURSTCNT(drv_ddram_burstcnt),
 	.DDRAM_ADDR(drv_ddram_addr),
 	.DDRAM_DOUT(DDRAM_DOUT),
-	.DDRAM_DOUT_READY(DDRAM_DOUT_READY),
+	.DDRAM_DOUT_READY(drv_ddram_ready),
 	.DDRAM_RD(drv_ddram_rd),
 	.DDRAM_WE(drv_ddram_we),
 	.DDRAM_DIN(drv_ddram_din),
-	.DDRAM_BE(drv_ddram_be)
+	.DDRAM_BE(drv_ddram_be),
+
+	// segments DRV9_1581, DRV8_1581, DRV9_1541, DRV8_1541: OPL3 -> 1581 x2 -> 1541 x2 -> INPUT
+	.ss_en(ss_chain_en),
+	.ss_hold(ss_frz_ack),
+	.ss_load_done(ss_load_done),
+	.ss_si(ss_opl_so),
+	.ss_so(ss_drv_so),
+	.ss_idle(ss_drv_idle),
+	.ss_1581(ss_drv_1581),
+	.ss_rgn_sel(ss_drv_rgn_sel),
+	.ss_rgn_sel81(ss_drv_rgn_sel81),
+	.ss_rgn_addr(ss_rgn_addr[12:0]),
+	.ss_rgn_req(ss_rgn_req),
+	.ss_rgn_we(ss_rgn_we),
+	.ss_rgn_wdata(ss_rgn_wdata),
+	.ss_rgn_rdata(ss_drv_rgn_rdata),
+	.ss_rgn_ack(ss_drv_rgn_ack)
 	);
 
-reg drive_ce;
-always @(posedge clk_sys) begin
-	int sum = 0;
-	int msum;
-	
-	msum <= ntsc ? 32727264 : 31527954;
+// TOP segment (WP A7): engine -> TAPE -> RTC -> TOP -> fpga64 (SYS). Bit 0
+// leaves first: drive_sum, disk_access, disk_access_to, then the
+// IEC/parallel edge detectors. The drive clock enable stops with the machine
+// and keeps its phase across a pause and a load (drive_ce is 0 while stopped
+// and never shifts: a bit passing through it would clock the drives); the
+// activity detector (turbo off, parallel cable routing) holds on the clocks
+// where the drives and the C64 hold (drv_pause). The rest of the glue here is rebuilt at every freeze
+// (savestate/state_classes.yaml).
+reg        drive_ce;
+reg [31:0] drive_sum = 0;
+reg [31:0] drive_msum;
+reg        disk_access;
+reg [31:0] disk_access_to = 0;
+reg        c64_iec_clk_old, drive_iec_clk_old, drive_stb_i_old, drive_stb_o_old;
+wire [68:0] ss_top_q = {drive_stb_o_old, drive_stb_i_old, drive_iec_clk_old, c64_iec_clk_old,
+                        disk_access_to, disk_access, drive_sum};
+wire [68:0] ss_top_d = {ss_rtc_so, ss_top_q[68:1]};
+assign ss_top_so = ss_top_q[0];
 
+always @(posedge clk_sys) begin
+	reg [32:0] nsum;
+
+	drive_msum <= ntsc ? 32727264 : 31527954;
+
+	nsum = drive_sum + 16000000;
 	drive_ce <= 0;
-	sum = sum + 16000000;
-	if(sum >= msum) begin
-		sum = sum - msum;
-		drive_ce <= 1;
+	if (ss_chain_en) drive_sum <= ss_top_d[31:0];
+	else if (~c64_pause) begin
+		drive_sum <= nsum[31:0];
+		if(nsum >= drive_msum) begin
+			drive_sum <= nsum[31:0] - drive_msum;
+			drive_ce <= 1;
+		end
 	end
 end
 
 wire disk_parport = (status[98:97] == 0) | par_on;
 
-reg disk_access;
-always @(posedge clk_sys) begin
-	reg c64_iec_clk_old, drive_iec_clk_old, drive_stb_i_old, drive_stb_o_old;
-	integer to = 0;
+// c64_pause one clock later: the clocks where the drives (c1541_multi stop)
+// and the C64 (EXT5 onwards) hold, so both sides are sampled on their grid
+reg drv_pause = 0;
+always @(posedge clk_sys) drv_pause <= c64_pause;
 
-	c64_iec_clk_old <= c64_iec_clk;
-	drive_iec_clk_old <= drive_iec_clk;
-	drive_stb_i_old <= drive_stb_i;
-	drive_stb_o_old <= drive_stb_o;
-	
-	if(((c64_iec_clk_old != c64_iec_clk) || (drive_iec_clk_old != drive_iec_clk)) || 
-		(disk_parport && ((drive_stb_i_old != drive_stb_i) || (drive_stb_o_old != drive_stb_o))))
-	begin
-		disk_access <= 1;
-		to <= 16000000; // 0.5s
+always @(posedge clk_sys) begin
+	if (ss_chain_en) {drive_stb_o_old, drive_stb_i_old, drive_iec_clk_old, c64_iec_clk_old, disk_access_to, disk_access} <= ss_top_d[68:32];
+	else if (~drv_pause) begin   // the 0.5 s timeout holds with the machine
+		c64_iec_clk_old <= c64_iec_clk;
+		drive_iec_clk_old <= drive_iec_clk;
+		drive_stb_i_old <= drive_stb_i;
+		drive_stb_o_old <= drive_stb_o;
+
+		if(((c64_iec_clk_old != c64_iec_clk) || (drive_iec_clk_old != drive_iec_clk)) ||
+			(disk_parport && ((drive_stb_i_old != drive_stb_i) || (drive_stb_o_old != drive_stb_o))))
+		begin
+			disk_access <= 1;
+			disk_access_to <= 16000000; // 0.5s
+		end
+		else if(disk_access_to) disk_access_to <= disk_access_to - 1'd1;
+		else disk_access <= 0;
 	end
-	else if(to) to <= to - 1;
-	else disk_access <= 0;
 end
 
 wire ext_iec_en   = status[25];
@@ -1207,6 +1394,8 @@ wire hblank;
 wire vblank;
 wire hsync_out;
 wire vsync_out;
+wire vs_tick;
+wire vs_resume_ok;
 
 video_sync sync
 (
@@ -1214,12 +1403,16 @@ video_sync sync
 	.pause(c64_pause),
 	.hsync(hsync),
 	.vsync(vsync),
+	.vic_x(vic_x),
+	.vic_y(vic_y),
 	.ntsc(ntsc),
 	.wide(wide),
 	.hsync_out(hsync_out),
 	.vsync_out(vsync_out),
 	.hblank(hblank),
-	.vblank(vblank)
+	.vblank(vblank),
+	.tick(vs_tick),
+	.resume_ok(vs_resume_ok)
 );
 
 reg hq2x160;
@@ -1284,8 +1477,10 @@ video_freak video_freak
 	.SCALE(status[31:30])
 );
 
+// freeze changes only on a frame boundary of the scaler (freeze_sync), so HDMI
+// keeps a whole frame.
 wire freeze_sync;
-reg freeze;
+reg freeze = 0;
 always @(posedge clk_sys) begin
 	reg old_sync;
 	
@@ -1293,7 +1488,383 @@ always @(posedge clk_sys) begin
 	if(old_sync ^ freeze_sync) freeze <= OSD_STATUS & status[42];
 end
 
-assign HDMI_FREEZE = freeze;
+// The machine stops on a C64 cycle, but restarts only when video_sync's
+// free-running position is back on the one of the stopped VIC (vs_resume_ok,
+// at most one frame later; after a savestate load the loaded VIC): the sync
+// on the analog output and into the scaler never jumps. A watchdog releases
+// anyway after 4,194,303 clk_sys (~133 ms PAL) if alignment fails.
+reg        pause_rel = 0;
+reg [21:0] pause_wd = 0;
+always @(posedge clk_sys) begin
+	// a savestate operation holds the machine through ss_freeze: wait for a
+	// realignment after it (the chain moves the VIC position meanwhile), not
+	// for one that came during it
+	if(~c64_pause | freeze | ss_freeze_req) begin
+		pause_rel <= 0;
+		pause_wd  <= 0;
+	end
+	else begin
+		if(~&pause_wd) pause_wd <= pause_wd + 1'd1;
+		if(vs_resume_ok | &pause_wd) pause_rel <= 1;
+	end
+end
+assign c64_pause_in = freeze | (c64_pause & ~pause_rel);
+
+// Frame buffer: while stopped, the analog output (and the scaler) show the
+// last frame with a regular sync instead of a stopped VIC.
+wire [3:0] out_idx;
+pause_fb pause_fb
+(
+	.clk(clk_sys),
+	.tick(vs_tick),
+	.hblank(hblank),
+	.vblank(vblank),
+	.paused(c64_pause),
+	.idx_in(vic_idx),
+	.idx_out(out_idx)
+);
+
+wire [7:0] vr, vg, vb;
+fpga64_rgbcolor out_palette
+(
+	.palette(status[84:82]),
+	.index(out_idx),
+	.r(vr),
+	.g(vg),
+	.b(vb)
+);
+
+assign HDMI_FREEZE = freeze | ss_frz_ack;
+
+///////////////////////////////// savestates (WP A2) /////////////////////////////////
+// docs/SAVESTATES.md. Four 8 MiB slots in DDR3 at 0x3E000000 (SS3E000000:800000),
+// the scratch slot of the OSD self-test is the 8 MiB below them (0x3D800000).
+
+`include "rtl/savestate/c64_savestates.vh"
+
+// build hash in the slot: BUILD_DATE "yymmdd" as BCD 0x00yymmdd
+localparam [47:0] SS_BD = `BUILD_DATE;
+localparam [31:0] SS_BUILD_HASH = {8'd0, SS_BD[43:40], SS_BD[35:32], SS_BD[27:24], SS_BD[19:16], SS_BD[11:8], SS_BD[3:0]};
+
+// configuration compared on load (map.yaml config_mask)
+wire [31:0] ss_config =
+	({30'd0, status[54:53]} << `SS_CFG_REU_SIZE)        |
+	({31'd0, status[52]}    << `SS_CFG_GEORAM)          |
+	({31'd0, ss_drv_1581[0]} << `SS_CFG_DRIVE8_TYPE)    |   // 1 = 1581 (mounted D81)
+	({31'd0, ss_drv_1581[1]} << `SS_CFG_DRIVE9_TYPE)    |
+	({31'd0, status[13]}    << `SS_CFG_SID_LEFT_MODEL)  |
+	({31'd0, status[16]}    << `SS_CFG_SID_RIGHT_MODEL) |
+	({31'd0, status[2]}     << `SS_CFG_NTSC)            |
+	({30'd0, status[35:34]} << `SS_CFG_VIC_VARIANT)     |
+	({31'd0, status[45]}    << `SS_CFG_CIA_MODEL)       |
+	({31'd0, status[12]}    << `SS_CFG_OPL_ENABLE)      |
+	({30'd0, status[15:14]} << `SS_CFG_KERNAL)          |
+	({24'd0, cart_attached ? cart_id : 8'hFF} << `SS_CFG_CART_TYPE);
+
+// Boundary of the second freeze level (ss_freeze): every bit must be 1 on the
+// sample where the machine stops. Blocks expose only their idle signal.
+wire       ss_drv_ddr_idle;
+wire [8:0] ss_idle = {
+	ss_drv_ddr_idle,                                          // 8 drive track cache: no DDR3 transfer
+	tape_ss_idle,                                             // 7 tape: no TAP prefetch byte in flight
+	~ioctl_req_wr & ~ioctl_req_rd,                            // 6 SDRAM: no io-cycle access of the host pending (the EasyFlash write-back is on the chain)
+	~ioctl_download & ~ioctl_upload & ~inj_meminit & ~erasing & ~force_erase, // 5 no download/upload/RAM init
+	~|sd_rd & ~|sd_wr & ~|sd_ack,                             // 4 drives: no SD block transfer (c1541_track, 1581 sectors)
+	ss_drv_idle,                                              // 3 1541/1581 x2: CPUs between instructions, no track or sector transfer starting
+	~dma_req,                                                 // 2 REU: no DMA
+	reset_n & ~RESET & ~status[0] & ~status[17] & ~buttons[1] & ~reset_wait, // 1 no reset pending
+	c64_cpu_sync                                              // 0 C64 CPU between instructions
+};
+
+wire       ss_frz_forced;
+
+// A machine stopped away from a boundary (OSD pause) runs to the next one for
+// the engine on the sample after vs_resume_ok, when the video output is on
+// the stopped VIC: the same timing as the pause release (pause_rel)
+reg        ss_run_ok = 0;
+always @(posedge clk_sys) ss_run_ok <= vs_resume_ok;
+
+ss_freeze #(.N(9), .WDOG_BITS(27)) ss_frz
+(
+	.clk(clk_sys),
+	.req(ss_freeze_req),
+	.user_pause(c64_pause_in),
+	.run_ok(ss_run_ok),
+	.sample(refresh),
+	.c64_pause(c64_pause),
+	.idle(ss_idle),
+	.pause(ss_pause),
+	.ack(ss_frz_ack),
+	.forced(ss_frz_forced),
+	.block()
+);
+
+// engine
+wire        ss_busy, ss_done, ss_result_load, ss_loading;
+wire  [3:0] ss_result;
+wire [31:0] ss_crc;
+wire [28:0] ss_ddr_addr;
+wire [63:0] ss_ddr_wdata, ss_ddr_rdata;
+wire  [7:0] ss_ddr_be;
+wire        ss_ddr_req, ss_ddr_we, ss_ddr_ack;
+wire        ss_eng_save, ss_eng_load, ss_eng_hold;
+wire [28:0] ss_eng_addr;
+wire        ss_inhibit = ioctl_download | ioctl_upload | ~reset_n | erasing | inj_meminit;
+
+// REU_RAM region: the REU is in the SDRAM at REU_ADDR, size from the OSD option.
+// 512 KiB and 2 MiB fit an 8 MiB slot; 16 MiB is refused (docs/SAVESTATES.md).
+wire [24:0] ss_reu_bytes = (reu_cfg == 2'd1) ? 25'h0080000 :
+                           (reu_cfg == 2'd2) ? 25'h0200000 :
+                           (reu_cfg == 2'd3) ? 25'h1000000 : 25'd0;
+
+// regions present: RAM, Color RAM, REU and GeoRAM when enabled, cartridge RAM
+// banks with a CRT attached (the EasyFlash RAM is bank 0), EasyFlash flash with
+// an EasyFlash CRT (D2), RAM, RAM expansion and track buffer of both 1541 units
+// (A8), RAM and sector buffer of both 1581 units (A10), the OPL3 register
+// shadow with the Sound Expander on (A9).
+wire [`SS_REGION_COUNT:0] ss_present =
+	(1 << (`SS_RGN_RAM + 1)) | (1 << (`SS_RGN_COLORRAM + 1)) |
+	({31'd0, |reu_cfg}       << (`SS_RGN_REU_RAM + 1))    |
+	({31'd0, status[52] & ~cart_attached} << (`SS_RGN_GEORAM + 1)) |
+	({31'd0, cart_attached}  << (`SS_RGN_CART_RAM + 1))   |
+	({31'd0, cart_ezfl}      << (`SS_RGN_CART_FLASH + 1)) |
+	(1 << (`SS_RGN_RAM_DRV8 + 1))    | (1 << (`SS_RGN_RAM_DRV9 + 1))    |
+	(1 << (`SS_RGN_EXTRAM_DRV8 + 1)) | (1 << (`SS_RGN_EXTRAM_DRV9 + 1)) |
+	(1 << (`SS_RGN_TRACK_DRV8 + 1))  | (1 << (`SS_RGN_TRACK_DRV9 + 1))  |
+	(1 << (`SS_RGN_RAM_1581_8 + 1))  | (1 << (`SS_RGN_RAM_1581_9 + 1))  |
+	(1 << (`SS_RGN_FDC_BUF_8 + 1))   | (1 << (`SS_RGN_FDC_BUF_9 + 1))   |
+	({31'd0, opl_en}         << (`SS_RGN_OPL3_REGS + 1));
+
+// LIVE: map.yaml segments inserted in the chain below (bit `SS_SEG_<NAME>)
+savestates #(.BUILD_HASH(SS_BUILD_HASH), .LIVE((32'd1 << `SS_SEG_CPU) | (32'd1 << `SS_SEG_VIC) | (32'd1 << `SS_SEG_CIA1) |
+                                               (32'd1 << `SS_SEG_CIA2) | (32'd1 << `SS_SEG_SID1) | (32'd1 << `SS_SEG_SID2) |
+                                               (32'd1 << `SS_SEG_REU) | (32'd1 << `SS_SEG_CART) | (32'd1 << `SS_SEG_SYS) |
+                                               (32'd1 << `SS_SEG_RTC) | (32'd1 << `SS_SEG_TAPE) | (32'd1 << `SS_SEG_INPUT) |
+                                               (32'd1 << `SS_SEG_TOP) | (32'd1 << `SS_SEG_DRV8_1541) | (32'd1 << `SS_SEG_DRV9_1541) |
+                                               (32'd1 << `SS_SEG_DRV8_1581) | (32'd1 << `SS_SEG_DRV9_1581) |
+                                               (32'd1 << `SS_SEG_OPL3))) ss_engine
+(
+	.clk(clk_sys),
+	.reset(~pll_locked),
+
+	.save(ss_eng_save),
+	.load(ss_eng_load),
+	.slot_addr(ss_eng_addr),
+	.hold(ss_eng_hold | ss_opl_replay),   // an OPL3 replay holds the machine until it is queued
+	.sd_count(~status[99]),
+	.inhibit(ss_inhibit),
+	.busy(ss_busy),
+	.done(ss_done),
+	.result(ss_result),
+	.result_load(ss_result_load),
+	.last_crc(ss_crc),
+
+	.freeze_req(ss_freeze_req),
+	.freeze_ack(ss_frz_ack),
+	.freeze_forced(ss_frz_forced),
+
+	.config_mask(ss_config),
+	.rgn_present(ss_present),
+	.reu_bytes(ss_reu_bytes),
+
+	.chain_en(ss_chain_en),
+	.chain_so(ss_chain_so),
+	.chain_si(ss_chain_si),
+	.loading(ss_loading),
+	.load_done(ss_load_done),
+
+	.rgn_tag(ss_rgn_tag),
+	.rgn_addr(ss_rgn_addr),
+	.rgn_req(ss_rgn_req),
+	.rgn_we(ss_rgn_we),
+	.rgn_wdata(ss_rgn_wdata),
+	.rgn_rdata(ss_rgn_rdata),
+	.rgn_ack(ss_rgn_ack),
+
+	.ddr_addr(ss_ddr_addr),
+	.ddr_wdata(ss_ddr_wdata),
+	.ddr_be(ss_ddr_be),
+	.ddr_req(ss_ddr_req),
+	.ddr_we(ss_ddr_we),
+	.ddr_rdata(ss_ddr_rdata),
+	.ddr_ack(ss_ddr_ack)
+);
+
+// Scan chain, in clk_sys: engine -> [segment with the highest map word
+// address] -> ... -> [word 0] -> engine, each shifting on ss_chain_en. A chip
+// WP inserts its segment here and sets its bit in LIVE above; segments not
+// live are not on the chain (their words are written as 0). Live: TAPE ->
+// RTC -> TOP (c64.sv) -> SYS (fpga64) -> ss_ext_so -> OPL3 -> DRV9_1581 ->
+// DRV8_1581 -> DRV9_1541 -> DRV8_1541 (iec_drive) -> INPUT (mouse) -> CART
+// (cartridge, DigiMax) -> REU -> ss_ext_si -> SID2 -> SID1 -> CIA2 -> CIA1 ->
+// VIC -> CPU (fpga64).
+
+// SDRAM regions through the paced port: RAM 0x0000000, cartridge RAM banks
+// 0x0010000 (cartridge.v get_bank), EasyFlash flash 0x0200000 (ezmem_addr),
+// GeoRAM 0x0C00000 ({3'b011, geo_bank}), REU 0x1000000 (REU_ADDR)
+reg        ss_sd_req = 0;
+wire       ss_sd_ack;
+wire [7:0] ss_sd_rdata;
+wire       ss_rgn_is_sd = (ss_rgn_tag == `SS_TAG_RAM) || (ss_rgn_tag == `SS_TAG_REU_RAM) || (ss_rgn_tag == `SS_TAG_GEORAM) ||
+                          (ss_rgn_tag == `SS_TAG_CART_RAM) || (ss_rgn_tag == `SS_TAG_CART_FLASH);
+reg [24:0] ss_rgn_sd_addr;
+always @* begin
+	case (ss_rgn_tag)
+		`SS_TAG_REU_RAM:    ss_rgn_sd_addr = REU_ADDR + {1'b0, ss_rgn_addr};
+		`SS_TAG_GEORAM:     ss_rgn_sd_addr = 25'h0C00000 + {3'b000, ss_rgn_addr[21:0]};
+		`SS_TAG_CART_FLASH: ss_rgn_sd_addr = 25'h0200000 + {5'd0, ss_rgn_addr[19:0]};
+		`SS_TAG_CART_RAM:   ss_rgn_sd_addr = 25'h0010000 + {9'd0, ss_rgn_addr[15:0]};
+		default:            ss_rgn_sd_addr = {9'd0, ss_rgn_addr[15:0]};
+	endcase
+end
+always @(posedge clk_sys) begin
+	if (ss_rgn_req & ss_rgn_is_sd) ss_sd_req <= 1;
+	else if (ss_sd_ack) ss_sd_req <= 0;
+end
+
+ss_sdram_port ss_sdram
+(
+	.clk(clk_sys),
+	.refresh(refresh),
+	.enable(ss_frz_ack & ss_busy),
+	.req(ss_sd_req),
+	.we(ss_rgn_we),
+	.addr(ss_rgn_sd_addr),
+	.wdata(ss_rgn_wdata),
+	.ack(ss_sd_ack),
+	.rdata(ss_sd_rdata),
+	.own(ss_sd_own),
+	.ce(ss_sd_ce),
+	.sd_we(ss_sd_we),
+	.sd_addr(ss_sd_addr),
+	.sd_din(ss_sd_din),
+	.sd_dout(sdram_data)
+);
+
+// Color RAM: the engine borrows the fpga64 port (spram, 1 clock read latency)
+reg       ss_cram_ack = 0;
+reg [1:0] ss_cram_st = 0;
+always @(posedge clk_sys) begin
+	ss_cram_ack <= 0;
+	ss_cram_we  <= 0;
+	if (ss_rgn_req && ss_rgn_tag == `SS_TAG_COLORRAM) begin
+		ss_cram_act  <= 1;
+		ss_cram_addr <= ss_rgn_addr[9:0];
+		ss_cram_we   <= ss_rgn_we;
+		ss_cram_din  <= ss_rgn_wdata[3:0];
+		ss_cram_st   <= 1;
+	end
+	else if (ss_cram_st == 1) ss_cram_st <= 2;
+	else if (ss_cram_st == 2) begin
+		ss_cram_st  <= 0;
+		ss_cram_ack <= 1;
+	end
+	if (~ss_busy) ss_cram_act <= 0;
+end
+
+// Drive regions through the byte port of iec_drive (block RAM port a, 3 clocks
+// per byte): RAM, RAM expansion and track buffer of each 1541 unit, RAM and
+// sector buffer (WD1772 FIFO) of each 1581 unit
+assign ss_drv_rgn_sel = {ss_rgn_tag == `SS_TAG_TRACK_DRV9, ss_rgn_tag == `SS_TAG_EXTRAM_DRV9, ss_rgn_tag == `SS_TAG_RAM_DRV9,
+                         ss_rgn_tag == `SS_TAG_TRACK_DRV8, ss_rgn_tag == `SS_TAG_EXTRAM_DRV8, ss_rgn_tag == `SS_TAG_RAM_DRV8};
+assign ss_drv_rgn_sel81 = {ss_rgn_tag == `SS_TAG_FDC_BUF_9, ss_rgn_tag == `SS_TAG_RAM_1581_9,
+                           ss_rgn_tag == `SS_TAG_FDC_BUF_8, ss_rgn_tag == `SS_TAG_RAM_1581_8};
+
+assign ss_rgn_ack   = ss_sd_ack | ss_cram_ack | ss_drv_rgn_ack | ss_opl_rgn_ack;
+assign ss_rgn_rdata = ss_cram_ack ? {4'h0, ss_cram_q} : ss_drv_rgn_ack ? ss_drv_rgn_rdata :
+                      ss_opl_rgn_ack ? ss_opl_rgn_rdata : ss_sd_rdata;
+
+// DDR3: drive track cache and savestate engine
+ss_ddram_arb ss_ddr
+(
+	.clk(clk_sys),
+
+	.d_burstcnt(drv_ddram_burstcnt),
+	.d_addr(drv_ddram_addr),
+	.d_rd(drv_ddram_rd),
+	.d_we(drv_ddram_we),
+	.d_din(drv_ddram_din),
+	.d_be(drv_ddram_be),
+	.d_busy(drv_ddram_busy),
+	.d_dout_ready(drv_ddram_ready),
+	.d_idle(ss_drv_ddr_idle),
+
+	.e_session(ss_busy),
+	.e_req(ss_ddr_req),
+	.e_we(ss_ddr_we),
+	.e_addr(ss_ddr_addr),
+	.e_wdata(ss_ddr_wdata),
+	.e_be(ss_ddr_be),
+	.e_ack(ss_ddr_ack),
+	.e_rdata(ss_ddr_rdata),
+
+	.DDRAM_BUSY(DDRAM_BUSY),
+	.DDRAM_BURSTCNT(DDRAM_BURSTCNT),
+	.DDRAM_ADDR(DDRAM_ADDR),
+	.DDRAM_DOUT(DDRAM_DOUT),
+	.DDRAM_DOUT_READY(DDRAM_DOUT_READY),
+	.DDRAM_RD(DDRAM_RD),
+	.DDRAM_WE(DDRAM_WE),
+	.DDRAM_DIN(DDRAM_DIN),
+	.DDRAM_BE(DDRAM_BE)
+);
+
+// requests and self-test
+wire [1:0] ss_active_slot;
+wire       ss_active_load, ss_active_test, ss_test_done, ss_test_pass;
+wire       ss_ui_save, ss_ui_load, ss_ui_test;
+
+statemanager #(.SLOT_WORDS(`SS_SLOT_BYTES >> 3)) ss_mgr
+(
+	.clk(clk_sys),
+	.reset(~reset_n),
+	.slot(ss_slot),
+	.save(ss_ui_save),
+	.load(ss_ui_load),
+	.selftest(ss_ui_test),
+	.eng_save(ss_eng_save),
+	.eng_load(ss_eng_load),
+	.eng_addr(ss_eng_addr),
+	.eng_hold(ss_eng_hold),
+	.eng_busy(ss_busy | ss_opl_replay),   // next operation after the OPL3 replay
+	.eng_done(ss_done),
+	.eng_result(ss_result),
+	.eng_crc(ss_crc),
+	.active_slot(ss_active_slot),
+	.active_load(ss_active_load),
+	.active_test(ss_active_test),
+	.test_done(ss_test_done),
+	.test_pass(ss_test_pass)
+);
+
+savestate_ui #(.INFO_TIMEOUT_BITS(25)) ss_ui
+(
+	.clk(clk_sys),
+	.ps2_key(ps2_key),
+	.allow_ss(reset_n & ~ioctl_download & ~ioctl_upload),
+	.joySS(joy[10]),
+	.joyRight(joy[0]),
+	.joyLeft(joy[1]),
+	.joyDown(joy[2]),
+	.joyUp(joy[3]),
+	.status_slot(status[101:100]),
+	.OSD_saveload(status[104:102]),
+	.ss_save(ss_ui_save),
+	.ss_load(ss_ui_load),
+	.ss_test(ss_ui_test),
+	.ss_info_req(ss_info_req),
+	.ss_info(ss_info),
+	.kbd_eat(ss_kbd_eat),
+	.ss_done(ss_done),
+	.ss_result(ss_result),
+	.ss_test_active(ss_active_test),
+	.ss_test_done(ss_test_done),
+	.ss_test_pass(ss_test_pass),
+	.ss_active_slot(ss_active_slot),
+	.ss_active_load(ss_active_load),
+	.statusUpdate(ss_status_upd),
+	.selected_slot(ss_slot)
+);
 
 // Snoop DDRAM reads and writes for debug overlay
 reg [63:0] dbg_ddram_data = 0;
@@ -1320,7 +1891,7 @@ always @(posedge clk_sys) begin
         dbg_wait_data <= 1;
 		end
 
-		if (DDRAM_DOUT_READY && dbg_wait_data) begin
+		if (drv_ddram_ready && dbg_wait_data) begin
 			dbg_ddram_data <= DDRAM_DOUT;
 			dbg_out_addr   <= dbg_ddram_addr;
 			dbg_valid      <= 1;
@@ -1468,9 +2039,9 @@ video_mixer #(.GAMMA(1)) video_mixer
 	.gamma_bus(gamma_bus),
 
 	.ce_pix(ce_pix),
-	.R((ovl_color & 4) ? 8'hFF : ovl_color ? 8'h00 : r),
-	.G((ovl_color & 2) ? 8'hFF : ovl_color ? 8'h00 : g),
-	.B((ovl_color & 1) ? 8'hFF : ovl_color ? 8'h00 : b),
+	.R((ovl_color & 4) ? 8'hFF : ovl_color ? 8'h00 : vr),
+	.G((ovl_color & 2) ? 8'hFF : ovl_color ? 8'h00 : vg),
+	.B((ovl_color & 1) ? 8'hFF : ovl_color ? 8'h00 : vb),
 	.HSync(hsync_out),
 	.VSync(vsync_out),
 	.HBlank(hblank),
@@ -1496,14 +2067,36 @@ opl3 #(.OPLCLK(47291931)) opl_inst
 	.clk(clk_sys),
 	.clk_opl(clk48),
 	.rst_n(reset_n & opl_en),
+	.pause(c64_pause),
 
 	.addr(c64_addr[4]),
 	.dout(opl_dout),
 	.we(ram_we & IOF & opl_en & c64_addr[6] & ~c64_addr[5]),
 	.din(c64_data_out),
 
-	.sample_l(opl_out)
+	.sample_l(opl_out),
+
+	// segment OPL3: ss_ext_so (SYS) -> OPL3 -> 1541 x2; region OPL3_REGS
+	.ss_en(ss_chain_en),
+	.ss_hold(ss_frz_ack),
+	.ss_load_done(ss_load_done),
+	.ss_si(ss_ext_so),
+	.ss_so(ss_opl_so),
+	.ss_replay(ss_opl_replay),
+	.ss_rgn_sel(ss_rgn_tag == `SS_TAG_OPL3_REGS),
+	.ss_rgn_req(ss_rgn_req),
+	.ss_rgn_we(ss_rgn_we),
+	.ss_rgn_addr(ss_rgn_addr[7:0]),
+	.ss_rgn_wdata(ss_rgn_wdata),
+	.ss_rgn_rdata(ss_opl_rgn_rdata),
+	.ss_rgn_ack(ss_opl_rgn_ack)
 );
+
+// The FM part runs on clk48 and stops a few clocks after the machine: the mix
+// takes its sample once per running C64 cycle (DMA0), so a pause or a save
+// leaves no trace in the mix.
+reg [15:0] opl_s;
+always @(posedge clk_sys) if (ext_cycle & ~ext_cycle_d) opl_s <= opl_out;
 
 reg ioe_we, iof_we;
 always @(posedge clk_sys) begin
@@ -1533,33 +2126,38 @@ always @(posedge clk_sys) begin
 	end
 end
 
-//DigiMax
+// DigiMax (savestate segment CART, after cartridge.v: digimax_act then
+// digimax_dac[0..3] from bit 0; dac_l/dac_r are rebuilt every clock)
 reg [8:0] dac_l, dac_r;
+reg [8:0] digimax_dac[4];
+reg [3:0] digimax_act;
+wire [39:0] ss_dmax_q = {digimax_dac[3], digimax_dac[2], digimax_dac[1], digimax_dac[0], digimax_act};
+assign ss_dmax_so = ss_dmax_q[0];
 always @(posedge clk_sys) begin
-	reg [8:0] dac[4];
-	reg [3:0] act;
-
-	if(!status[41:40] || ~reset_n) begin
-		dac <= '{0,0,0,0};
-		act <= 0;
-	end
-	else if((status[41] ? iof_we : ioe_we) && ~c64_addr[2]) begin
-		dac[c64_addr[1:0]] <= c64_data_out;
-		if(c64_data_out) act[c64_addr[1:0]] <= 1;
+	if (ss_chain_en) {digimax_dac[3], digimax_dac[2], digimax_dac[1], digimax_dac[0], digimax_act} <= {ss_cart_so, ss_dmax_q[39:1]};
+	else if (~c64_pause) begin   // holds with the machine (and while the chain shifts)
+		if(!status[41:40] || ~reset_n) begin
+			digimax_dac <= '{0,0,0,0};
+			digimax_act <= 0;
+		end
+		else if((status[41] ? iof_we : ioe_we) && ~c64_addr[2]) begin
+			digimax_dac[c64_addr[1:0]] <= c64_data_out;
+			if(c64_data_out) digimax_act[c64_addr[1:0]] <= 1;
+		end
 	end
 
 	// guess mono/stereo/4-chan modes
-	if(act<2) begin
-		dac_l <= dac[0] + dac[0];
-		dac_r <= dac[0] + dac[0];
+	if(digimax_act<2) begin
+		dac_l <= digimax_dac[0] + digimax_dac[0];
+		dac_r <= digimax_dac[0] + digimax_dac[0];
 	end
-	else if(act<3) begin
-		dac_l <= dac[1] + dac[1];
-		dac_r <= dac[0] + dac[0];
+	else if(digimax_act<3) begin
+		dac_l <= digimax_dac[1] + digimax_dac[1];
+		dac_r <= digimax_dac[0] + digimax_dac[0];
 	end
 	else begin
-		dac_l <= dac[1] + dac[2];
-		dac_r <= dac[0] + dac[3];
+		dac_l <= digimax_dac[1] + digimax_dac[2];
+		dac_r <= digimax_dac[0] + digimax_dac[3];
 	end
 end
 
@@ -1584,7 +2182,7 @@ always @(posedge clk_sys) begin
 	reg [15:0] cout;
 	reg [15:0] cin;
 	
-	cin  <= opl_out - {{3{opl_out[15]}},opl_out[15:3]};
+	cin  <= opl_s - {{3{opl_s[15]}},opl_s[15:3]};
 	cout <= compr(cin);
 
 	alm <= {cout[15],cout} + {audio_l[17],audio_l[17:2]} + {2'b0,dac_l,6'd0} + {cass_snd, 9'd0};
@@ -1618,6 +2216,7 @@ tape_subsystem tape
 (
 	.clk(clk_sys),
 	.ce(ce_sys),
+	.pause(c64_pause),
 	.reset_n(reset_n),
 	.hblank(hblank),
 	.vblank(vblank),
@@ -1652,22 +2251,40 @@ tape_subsystem tape
 
 	.tap_loaded(tap_loaded),
 	.tap_play_addr(tap_play_addr),
+	.ss_idle(tape_ss_idle),
 	.tap_last_addr(tap_last_addr),
 
-	.pixel_color(tape_ovl_color)
+	.pixel_color(tape_ovl_color),
+
+	.ss_en(ss_chain_en),
+	.ss_hold(ss_frz_ack),
+	.ss_si(ss_chain_so),
+	.ss_so(ss_tapess_so)
 );
 
-reg use_tape;
+// TAPE segment (WP A7), first in from the engine: chain_so -> tape_subsystem
+// -> use_tape_to, ss_use_tape (bit 0 leaves first) -> RTC. use_tape drives
+// the cassette sense mux and the RTC reset on every clock: the chain carries
+// its copy ss_use_tape. The 4 s timeout holds with the machine.
+reg        use_tape;
+reg [31:0] use_tape_to = 0;
+reg        ss_use_tape;
+wire [32:0] ss_tapeg_q = {ss_use_tape, use_tape_to};
+assign ss_tape_so = ss_tapeg_q[0];
 always @(posedge clk_sys) begin
-	integer to = 0;
+	if (ss_chain_en) {ss_use_tape, use_tape_to} <= {ss_tapess_so, ss_tapeg_q[32:1]};
+	else if (~ss_frz_ack) ss_use_tape <= use_tape;
 
-	if(to) to <= to - 1;
-	else use_tape <= status[36];
+	if (~c64_pause & ~ss_chain_en) begin
+		if(use_tape_to) use_tape_to <= use_tape_to - 1'd1;
+		else use_tape <= status[36];
 
-	if(tap_loaded | ~cass_sense) begin
-		use_tape <= 1;
-		to <= 128000000; //4s
+		if(tap_loaded | ~cass_sense) begin
+			use_tape <= 1;
+			use_tape_to <= 128000000; //4s
+		end
 	end
+	if (ss_load_done) use_tape <= ss_use_tape;
 end
 
 reg [26:0] act_cnt;
@@ -1752,26 +2369,45 @@ always @(posedge clk_sys) begin
 	dsr1 <= UART_DSR & uart_int; dsr2 <= dsr1; if(dsr1 == dsr2) uart_dsr <= dsr2;
 end
 
+// RTC segment (WP A7): engine chain_so -> rtcF83 -> use_rtc_to, ss_use_rtc
+// (bit 0 leaves first) -> fpga64 ss_chain_si. use_rtc drives the cassette
+// read line on every clock: the chain carries its copy ss_use_rtc.
 wire rtcF83_sda;
+wire ss_rtcf_so;
 rtcF83 #(16000000, 0) rtcF83
 (
 	.clk(clk_sys),
-	.ce(drive_ce),
+	.ce(drive_ce & ~c64_pause),
 	.reset(~reset_n | use_tape),
 	.RTC(RTC),
 	.scl_i(cass_write),
 	.sda_i(cass_motor),
-	.sda_o(rtcF83_sda)
+	.sda_o(rtcF83_sda),
+
+	.stop(c64_pause),
+	.ss_en(ss_chain_en),
+	.ss_hold(ss_frz_ack),
+	.ss_load_done(ss_load_done),
+	.ss_si(ss_tape_so),
+	.ss_so(ss_rtcf_so)
 );
 
-reg use_rtc = 0;
+reg        use_rtc = 0;
+reg [20:0] use_rtc_to = 0;
+reg        ss_use_rtc;
+wire [21:0] ss_rtc_q = {ss_use_rtc, use_rtc_to};
+assign ss_rtc_so = ss_rtc_q[0];
 always @(posedge clk_sys) begin
-	reg [20:0] to = 0;
+	if (ss_chain_en) {ss_use_rtc, use_rtc_to} <= {ss_rtcf_so, ss_rtc_q[21:1]};
+	else if (~ss_frz_ack) ss_use_rtc <= use_rtc;
 
-	if(to) to <= to - 1'd1;
-	use_rtc <= |to;
+	if (~c64_pause & ~ss_chain_en) begin   // the timeout holds with the machine
+		if(use_rtc_to) use_rtc_to <= use_rtc_to - 1'd1;
+		use_rtc <= |use_rtc_to;
 
-	if(cass_write) to <= '1;
+		if(cass_write) use_rtc_to <= '1;
+	end
+	if (ss_load_done) use_rtc <= ss_use_rtc;
 end
 
 wire cass_rtc = ~(rtcF83_sda & use_rtc & cass_motor);

@@ -19,6 +19,15 @@
 //
 //============================================================================
 
+// Savestate (WP A7): the I2C side runs on every clock from the cassette port
+// lines and the time base on ce; both hold while the machine is stopped
+// (stop, ce is gated by the caller), so the clock seen by the C64 restarts
+// from the saved time after a load (virtual RTC: the host time is only taken
+// at core load, on the RTC[64] toggle). flg follows that host toggle: off
+// the chain, updated only while running, so a host update during a stop is
+// applied at the resume. sda_o drives the cassette read line on every clock:
+// the chain carries the copy ss_sda_o (follows it until ss_hold), written back
+// on ss_load_done. Field order: savestate/map.yaml (RTC).
 module rtcF83 #(parameter CLOCK_RATE, HAS_RAM = 1)
 (
 	input        clk,
@@ -29,7 +38,14 @@ module rtcF83 #(parameter CLOCK_RATE, HAS_RAM = 1)
 	
 	input        scl_i,
 	input        sda_i,
-	output reg   sda_o
+	output reg   sda_o,
+
+	input        stop,
+	input        ss_en,
+	input        ss_hold,
+	input        ss_load_done,
+	input        ss_si,
+	output       ss_so
 );
 
 localparam CTL  = 0;
@@ -47,32 +63,46 @@ wire [7:0] hrh  = (hr >= 12) ? (hr - 8'd12) : hr;
 wire [5:0] hr12 = (!hrh) ? 6'h12 : (hrh == 11) ? 6'h11 : (hrh == 10) ? 6'h10 : hrh[5:0];
 wire       pm   = (hr >= 12);
 
+reg  [1:0] sda_sr, scl_sr;
+reg        old_sda, old_scl;
+reg        sda, scl;
+reg  [7:0] tmp;
+reg  [3:0] cnt = 0;
+reg [10:0] bcnt = 0;
+reg        ack;
+reg        i2c_rw;
+reg  [7:0] ptr;
+reg  [7:0] data[256];
+reg  [7:0] tm[17];
+reg        flg = 0;
+reg [31:0] seccnt = 1;
+reg  [7:0] scl_d;
+reg  [7:0] sda_d;
+reg  [7:0] bt;
+reg        ss_sda_o;
+
+wire [233:0] ss_q = {tmp, tm[16], tm[15], tm[14], tm[13], tm[12], tm[11], tm[10], tm[9], tm[8], tm[7], tm[6], tm[5],
+                     tm[4], tm[3], tm[2], tm[1], tm[0], seccnt, sda_sr, ss_sda_o, sda_d, sda, scl_sr, scl_d, scl, ptr,
+                     old_sda, old_scl, i2c_rw, cnt, bt, bcnt, ack};
+wire [233:0] ss_d = {ss_si, ss_q[233:1]};
+assign ss_so = ss_q[0];
+
 always @(posedge clk) begin
-	reg  [1:0] sda_sr, scl_sr;
-	reg        old_sda, old_scl;
-	reg        sda, scl;
-	reg  [7:0] tmp;
-	reg  [3:0] cnt = 0;
-	reg [10:0] bcnt = 0;
-	reg        ack;
-	reg        i2c_rw;
-	reg  [7:0] ptr;
-	reg  [7:0] data[256];
-	reg  [7:0] tm[17];
-	reg        flg = 0;
-	reg [31:0] seccnt = 1;
-	reg  [7:0] scl_d;
-	reg  [7:0] sda_d;
-	reg  [7:0] bt;
+	if (ss_en)         ss_sda_o <= ss_d[55];
+	else if (!ss_hold) ss_sda_o <= sda_o;
+end
 
-	bt <= HAS_RAM ? data[ptr] : 8'h00;
+always @(posedge clk) begin
+	if (!stop) bt <= HAS_RAM ? data[ptr] : 8'h00;
 
-	if(reset) begin
+	// the reset is a level (held while the tape is in use): it must not clear
+	// ptr/cnt while their chain cells carry other bits
+	if(reset & ~ss_hold) begin
 		sda_o <= 1;
 		ptr <= 0;
 		cnt <= 0;
 	end
-	else begin
+	else if (!stop) begin
 		sda_sr <= {sda_sr[0],sda_i};
 		if(sda_sr[0] == sda_sr[1]) sda <= sda_sr[1];
 		old_sda <= sda;
@@ -208,18 +238,27 @@ always @(posedge clk) begin
 		end
 	end
 
-	flg <= RTC[64];
-	if (flg != RTC[64]) begin
-		tm[CTL]  <= 0;
-		tm[FSEC] <= 0;
-		tm[SEC]  <= RTC[6:0];
-		tm[MIN]  <= RTC[15:8];
-		tm[HR]   <= {1'b1,pm, hr12};
-		tm[DATE] <= {year[1:0],RTC[29:24]};
-		tm[MON]  <= {RTC[50:48],RTC[36:32]};
-		tm[YEAR] <= year;
-		seccnt   <= 1;
+	if (!stop) begin
+		flg <= RTC[64];
+		if (flg != RTC[64]) begin
+			tm[CTL]  <= 0;
+			tm[FSEC] <= 0;
+			tm[SEC]  <= RTC[6:0];
+			tm[MIN]  <= RTC[15:8];
+			tm[HR]   <= {1'b1,pm, hr12};
+			tm[DATE] <= {year[1:0],RTC[29:24]};
+			tm[MON]  <= {RTC[50:48],RTC[36:32]};
+			tm[YEAR] <= year;
+			seccnt   <= 1;
+		end
 	end
+
+	if (ss_en) begin
+		{tmp, tm[16], tm[15], tm[14], tm[13], tm[12], tm[11], tm[10], tm[9], tm[8], tm[7], tm[6], tm[5],
+		 tm[4], tm[3], tm[2], tm[1], tm[0], seccnt, sda_sr} <= ss_d[233:56];
+		{sda_d, sda, scl_sr, scl_d, scl, ptr, old_sda, old_scl, i2c_rw, cnt, bt, bcnt, ack} <= ss_d[54:0];
+	end
+	if (ss_load_done) sda_o <= ss_sda_o;
 end
 
 endmodule

@@ -56,11 +56,30 @@ module c1581_drv
 	input   [8:0] sd_buff_addr,
 	input   [7:0] sd_buff_dout,
 	output  [7:0] sd_buff_din,
-	input         sd_buff_wr
+	input         sd_buff_wr,
+
+	// savestate (WP A10, docs/SAVESTATES.md). Chain of the unit, bit 0 out
+	// first: fdc1772 (floppy mechanics, then the WD1772), 8520, VIA, T65, then
+	// the disk change line of this module. Regions RAM and FDC_BUF through a
+	// byte port while the engine owns the machine.
+	input         stop,          // drive stopped with the machine (ph2 grid): every-clock logic holds
+	input         ss_en,
+	input         ss_hold,       // the engine owns the unit (from the second stopped clock)
+	input         ss_si,
+	output        ss_so,
+	output        ss_idle,       // CPU between instructions, no sector request to the host pending or starting
+	input   [1:0] ss_rgn_sel,    // {FDC_BUF, RAM} of this unit
+	input  [12:0] ss_rgn_addr,
+	input         ss_rgn_req,
+	input         ss_rgn_we,
+	input   [7:0] ss_rgn_wdata,
+	output reg [7:0] ss_rgn_rdata,
+	output reg    ss_rgn_ack
 );
 
 assign rom_addr = cpu_a[14:0];
 
+// write protect of the mounted image (host side, latched at its mount)
 reg wps_n = 0;
 always @(posedge clk) begin
 	reg prev_mounted;
@@ -88,30 +107,49 @@ wire  [7:0] cpu_di =
 wire [23:0] cpu_a;
 wire  [7:0] cpu_do;
 wire        cpu_rw;
+wire        cpu_sync;
+
+wire        ss_cpu_so, ss_via_so, ss_cia_so;
+wire        fdc_idle, fdc_sd_rd, fdc_sd_wr;
+wire  [7:0] ss_fdc_q;
+reg         ss_rgn_wr = 0;
+reg         disk_chng_n;
 
 T65 cpu
 (
 	.clk(clk),
-	.enable(ph2_r),
+	.enable(ph2_r & ~stop),   // T65 SS_Hold freezes only its SO sampler: a ph2_r held while stopped, or a chain bit passing through it, must not step the CPU
 	.mode(2'b00),
 	.res_n(~reset),
 	.irq_n(cia_irq_n & ~via_irq),
 	.r_w_n(cpu_rw),
+	.sync(cpu_sync),
 	.A(cpu_a),
 	.DI(cpu_di),
-	.DO(cpu_do)
+	.DO(cpu_do),
+
+	.SS_En(ss_en),
+	.SS_Hold(stop),
+	.SS_SI(disk_chng_n),
+	.SS_SO(ss_cpu_so)
 );
 
+// The CPU writes on the ph2_f of running clocks only. iecdrv_mem takes the
+// data one clock after the address, so the engine takes the write port a
+// (ss_hold) one clock after the drive stopped, when a write of the last
+// running clock is in. The engine reads through the CPU read port b, on the
+// clock of its request only: a read on port a would make Quartus add a
+// second copy of the RAM (8 M10K).
 wire [7:0] ram_do;
 iecdrv_mem #(8,13) ram
 (
 	.clock_a(clk),
-	.address_a(cpu_a[12:0]),
-	.data_a(cpu_do),
-	.wren_a(ph2_f & ~cpu_rw & ram_cs),
+	.address_a(ss_hold ? ss_rgn_addr : cpu_a[12:0]),
+	.data_a(ss_hold ? ss_rgn_wdata : cpu_do),
+	.wren_a(ss_hold ? ss_rgn_wr & ss_rgn_sel[0] : ph2_f & ~stop & ~cpu_rw & ram_cs),
 
 	.clock_b(clk),
-	.address_b(cpu_a[12:0]),
+	.address_b(ss_hold & ss_rgn_req & ss_rgn_sel[0] ? ss_rgn_addr : cpu_a[12:0]),
 	.q_b(ram_do)
 );
 
@@ -164,7 +202,12 @@ iecdrv_mos8520 cia
 	.cnt_in(fast_dir | iec_fclk_i),
 	.cnt_out(cnt_out),
 
-	.irq_n(cia_irq_n)
+	.irq_n(cia_irq_n),
+
+	.stop(stop),
+	.ss_en(ss_en),
+	.ss_si(ss_via_so),
+	.ss_so(ss_cia_so)
 );
 
 
@@ -219,14 +262,24 @@ iecdrv_via6522 via
 	.cb2_t(via_cb2_oe),
 	.cb2_i(via_cb2_o | ~via_cb2_oe),
 
-	.irq(via_irq)
+	.irq(via_irq),
+
+	.ss_en(ss_en),
+	.ss_stop(stop),
+	.ss_si(ss_cpu_so),
+	.ss_so(ss_via_so)
 );
 
 
-reg disk_chng_n;
+// disk change line (PA7, on the chain, first bit in): a mount or the reset
+// clears it, the first head step sets it; the step pulse is a chain register,
+// so it counts only while the drive runs
 always @(posedge clk) begin
-	if(img_mounted | reset) disk_chng_n <=0;
-	if(floppy_step) disk_chng_n <=1;
+	if (ss_en) disk_chng_n <= ss_si;
+	else begin
+		if(img_mounted | reset) disk_chng_n <=0;
+		if(floppy_step & ~stop) disk_chng_n <=1;
+	end
 end
 
 wire       floppy_step;
@@ -258,8 +311,8 @@ fdc1772 #(.IMG_TYPE(1), .EXT_MOTOR(1), .FD_NUM(1)) fdc
 	.img_size(img_size),
 
 	.sd_lba(sd_lba),
-	.sd_rd(sd_rd),
-	.sd_wr(sd_wr),
+	.sd_rd(fdc_sd_rd),
+	.sd_wr(fdc_sd_wr),
 	.sd_ack(sd_ack),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_dout(sd_buff_dout),
@@ -267,7 +320,45 @@ fdc1772 #(.IMG_TYPE(1), .EXT_MOTOR(1), .FD_NUM(1)) fdc
 	.sd_dout_strobe(sd_buff_wr),
 
 	.track_out(track),
-	.we_out(we)
+	.we_out(we),
+
+	.stop(stop),
+	.ss_en(ss_en),
+	.ss_si(ss_cia_so),
+	.ss_so(ss_so),
+	.ss_idle(fdc_idle),
+	.ss_hold(ss_hold),
+	.ss_addr(ss_rgn_addr[9:0]),
+	.ss_wdata(ss_rgn_wdata),
+	.ss_wr(ss_rgn_wr & ss_rgn_sel[1]),
+	.ss_rgn_q(ss_fdc_q)
 );
+
+// Sector requests reach the host only while the drive runs: one raised on the
+// last running clocks before a savestate waits in the chain until the release.
+assign sd_rd = fdc_sd_rd & ~stop;
+assign sd_wr = fdc_sd_wr & ~stop;
+
+// Freeze boundary: CPU between instructions (or the unit held in reset), no
+// sector request pending towards the host and none starting on the next clock.
+assign ss_idle = (cpu_sync | reset) & fdc_idle;
+
+// Region port (RAM, FDC_BUF): one byte per request, acknowledged after the
+// 2-clock read latency of the RAM; writes land on port a meanwhile.
+reg [1:0] ss_rgn_cnt = 0;
+always @(posedge clk) begin
+	ss_rgn_ack <= 0;
+	ss_rgn_wr  <= 0;
+	if (ss_rgn_req & |ss_rgn_sel) begin
+		ss_rgn_cnt <= 1;
+		ss_rgn_wr  <= ss_rgn_we;
+	end
+	else if (ss_rgn_cnt == 1) ss_rgn_cnt <= 2;
+	else if (ss_rgn_cnt == 2) begin
+		ss_rgn_cnt   <= 0;
+		ss_rgn_ack   <= 1;
+		ss_rgn_rdata <= ss_rgn_sel[0] ? ram_do : ss_fdc_q;
+	end
+end
 
 endmodule

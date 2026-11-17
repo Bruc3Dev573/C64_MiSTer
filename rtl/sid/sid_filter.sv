@@ -31,7 +31,14 @@ module sid_filter
 	input signed [21:0] voice3,
 	input signed [21:0] ext_in,
 
-	output       [17:0] audio
+	output       [17:0] audio,
+
+	// savestate: the filter steps on every clock with state, so it holds while
+	// the machine is stopped (stop); scan chain of its registers
+	input               ss_en,
+	input               stop,
+	input               ss_si,
+	output              ss_so
 );
 
 localparam signed [23:0] MIXER_DC_6581 = 24'((-1 << 20)/18);
@@ -98,6 +105,13 @@ reg signed [16:0] center;
 reg signed [16:0] center_s;
 reg signed [15:0] tmix_c;
 reg signed [15:0] tmix_c_r;   // registered compressor output (extra pipe stage)
+reg        [10:0] _1_Q_lsl10;
+reg signed [17:0] vi = 0;   // wide-scale (signal<<2) input for 18-bit state
+reg signed [15:0] vd = 0;
+
+wire [271:0] ss_q = {tmix_c_r, center_s, tmix_s, vhp2, vhp, vbp2, vbp, vlp2, vlp, b, a, s, c, vd, vi, _1_Q_lsl10};
+wire [271:0] ss_d = {ss_si, ss_q[271:1]};
+assign ss_so = ss_q[0];
 
 always_comb begin
 	// Intermediate results for filter.
@@ -124,12 +138,7 @@ end
 
 // Filter
 always @(posedge clk) begin
-	reg [10:0] _1_Q_lsl10;
-
-	reg signed [17:0] vi = 0;   // wide-scale (signal<<2) input for 18-bit state
-	reg signed [15:0] vd = 0;
-
-	case (state)
+	if (!stop) case (state)
 		2:	begin
 				// MOS6581: 1/Q =~ ~res/8 (not used - op-amps are not ideal)
 				// MOS8580: 1/Q =~ 2^((4 - res)/8)
@@ -207,6 +216,7 @@ always @(posedge clk) begin
 				b <= clamp(17'(vd) + 17'(tmix_c_r));
 			end
 	endcase
+	if (ss_en) {tmix_c_r, center_s, tmix_s, vhp2, vhp, vbp2, vbp, vlp2, vlp, b, a, s, c, vd, vi, _1_Q_lsl10} <= ss_d;
 end
 
 assign audio = o[19:2];

@@ -52,6 +52,7 @@
 module opl3sw #(parameter OPLCLK = 50000000)
 (
 	input         reset,
+	input         pause,   // async to clk, synchronized below
 
 	// CPU interface
 	input         cpu_clk,
@@ -64,18 +65,20 @@ module opl3sw #(parameter OPLCLK = 50000000)
 	output [15:0] left,
 	output [15:0] right
 );
-	 
+
+wire  run, zce;   // clock enables of this domain: running (pause), Z80 step; below
 wire  [7:0] ram_dout;
 opl3_mem ram
 (
 	.clk(clk),
+	.ce(run),
 	.addr1(CPU_ADDR[12:0]),
-	.we1(CPU_MREQ & CPU_WR & CE),
+	.we1(CPU_MREQ & CPU_WR & zce),
 	.data_in1(CPU_DOUT),
 	.data_out1(ram_dout),
 
 	.addr2(OPL3Struct_base+seq_addr),
-	.we2(seq_wr),
+	.we2(seq_wr & run),
 	.data_in2(seq_wdata),
 	.data_out2(seq_rdata)
 );
@@ -94,20 +97,31 @@ opl3_fifo in_queue
 
 	.rdclk(clk),
 	.q(qdata),
-	.rdreq(CE && CPU_IORQ && !CPU_WR && CPU_ADDR[0]),
+	.rdreq(zce && CPU_IORQ && !CPU_WR && CPU_ADDR[0]),
 	.rdempty(qempty)
 );
 
+
+// Pause: bring the C64 pause into the OPL clock domain. While paused (run low)
+// everything here holds where it is and continues from there: the 44.1 kHz
+// strobe, the sequencer in the middle of a sample, both RAM ports, the Z80
+// (WAIT) on the same phase of its clock enable. clk is 3/2 clk_sys from the same
+// PLL, so a pause of whole C64 cycles shifts this domain by exactly that time.
+reg [1:0] pause_s;
+always @(posedge clk) pause_s <= {pause_s[0], pause};
+assign run = ~pause_s[1];
 
 reg stb44100;
 always @(posedge clk) begin
 	integer cnt;
 	localparam RATE = (OPLCLK/44100)-1;
 
-	cnt <= cnt+1;
-	if(cnt == RATE) cnt <= 0;
+	if(run) begin
+		cnt <= cnt+1;
+		if(cnt == RATE) cnt <= 0;
 
-	stb44100 <= !cnt;
+		stb44100 <= !cnt;
+	end
 end
 
 wire        seq_wr;
@@ -122,7 +136,7 @@ reg         seq_reset_n = 0;
 always @(posedge clk) begin
 	if(reset) seq_reset_n <= 0;
 
-	if(CPU_IORQ & CPU_WR & CE) begin
+	if(CPU_IORQ & CPU_WR & zce) begin
 		if(CPU_ADDR[0]) {seq_reset_n, OPL3Struct_base[11:7]} <= {1'b1, CPU_DOUT[4:0]};
 		else OPL3Struct_base[6:0] <= CPU_DOUT[7:1];
 	end
@@ -130,7 +144,8 @@ end
 
 opl3seq opl3seq
 (
-	.clk(clk), 
+	.clk(clk),
+	.ce(run),
 	.reset(~seq_reset_n),
 	.rd(stb44100),
 	.A(A), 
@@ -175,14 +190,23 @@ NextZ80 Z80
 	.HALT(),
 	.M1(),
 	.CLK(clk),
-	.RESET(reset),
+	.RESET(reset | zrst),
 	.INT(0),
 	.NMI(0),
-	.WAIT(!CE)
+	.WAIT(!zce)
 );
 
-reg CE = 0;
-always @(posedge clk) CE <= !CE;
+// Z80 clock enable: every other clk while running. The Z80 samples RESET only
+// on a step: a reset that comes and goes while paused (Sound Expander switched
+// off and on in the OSD) is taken on the next step instead of being lost, which
+// left the firmware polling a sequencer held in reset.
+reg  CE = 0, zrst = 0;
+assign zce = CE & run;
+always @(posedge clk) begin
+	if (run) CE <= ~CE;
+	if (reset) zrst <= 1;
+	else if (zce) zrst <= 0;
+end
 
 endmodule
 
@@ -196,15 +220,16 @@ module opl3_mem
 )
 (
 	input                        clk,
+	input                        ce,    // reads: the outputs keep the last read while low
 	input                        we1,
 	input   [ADDRESS_WIDTH1-1:0] addr1,
 	input      [DATA_WIDTH1-1:0] data_in1,
-	output reg [DATA_WIDTH1-1:0] data_out1,
+	output     [DATA_WIDTH1-1:0] data_out1,
 
 	input                        we2,
 	input   [ADDRESS_WIDTH2-1:0] addr2,
 	input      [DATA_WIDTH2-1:0] data_in2, 
-	output reg [DATA_WIDTH2-1:0] data_out2
+	output     [DATA_WIDTH2-1:0] data_out2
 );
 
 localparam RATIO = 1 << (ADDRESS_WIDTH1 - ADDRESS_WIDTH2);
@@ -214,13 +239,30 @@ localparam RAM_DEPTH = 1 << ADDRESS_WIDTH2;
 reg [RATIO-1:0] [DATA_WIDTH1-1:0] ram[0:RAM_DEPTH-1];
 initial $readmemh(INIT_FILE, ram);
 
+reg [DATA_WIDTH1-1:0] q1;
+reg [DATA_WIDTH2-1:0] q2;
+
 // Port A
 always@(posedge clk) if(we1) ram[addr1 / RATIO][addr1 % RATIO] = data_in1;
-always@(posedge clk) data_out1 <= ram[addr1 / RATIO][addr1 % RATIO];
+always@(posedge clk) q1 <= ram[addr1 / RATIO][addr1 % RATIO];
 
 // port B
 always@(posedge clk) if(we2) ram[addr2] = data_in2;
-always@(posedge clk) data_out2 <= ram[addr2];
+always@(posedge clk) q2 <= ram[addr2];
+
+// Read clock enable, outside the RAM template (an enable on q1/q2 makes Quartus
+// build the RAM out of logic): after a clock with ce low the outputs keep the
+// data of the last read with ce high. The caller gates the write enables.
+reg                   ce_d;
+reg [DATA_WIDTH1-1:0] h1;
+reg [DATA_WIDTH2-1:0] h2;
+assign data_out1 = ce_d ? q1 : h1;
+assign data_out2 = ce_d ? q2 : h2;
+always @(posedge clk) begin
+	ce_d <= ce;
+	h1   <= data_out1;
+	h2   <= data_out2;
+end
 
 endmodule
 

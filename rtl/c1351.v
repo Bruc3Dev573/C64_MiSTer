@@ -19,6 +19,10 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
+// Savestate (WP A7, segment INPUT): x, y, lfsr on the chain (bit 0 leaves
+// first: lfsr, x, y). The pot noise LFSR steps with the machine (stop);
+// movements made while paused still move the pointer, they only wait while
+// the engine owns the machine (ss_hold), then they are applied.
 module c1351
 (
 	input        clk_sys,
@@ -28,31 +32,47 @@ module c1351
 	
 	output [7:0] potX,
 	output [7:0] potY,
-	output [1:0] button
+	output [1:0] button,
+
+	input        stop,
+	input        ss_en,
+	input        ss_hold,
+	input        ss_si,
+	output       ss_so
 );
 
 reg [16:0] lfsr;
-always @(posedge clk_sys) lfsr <= {(lfsr[0] ^ lfsr[2] ^ !lfsr), lfsr[16:1]};
+reg  [5:0] x;
+reg  [5:0] y;
+
+wire [28:0] ss_q = {y, x, lfsr};
+wire [28:0] ss_d = {ss_si, ss_q[28:1]};
+assign ss_so = ss_q[0];
+
+always @(posedge clk_sys) begin
+	if (ss_en) lfsr <= ss_d[16:0];
+	else if (~stop) lfsr <= {(lfsr[0] ^ lfsr[2] ^ !lfsr), lfsr[16:1]};
+end
 
 assign potX = ~{1'b0, x, lfsr[0]};
 assign potY = ~{1'b0, y, lfsr[8]};
 assign button = ps2_mouse[1:0];
 
-reg [5:0] x;
-reg [5:0] y;
-
 always @(posedge clk_sys) begin
 	reg old_status;
-	
-	old_status <= ps2_mouse[24];
 
-	if(reset) begin
-		x <= 0;
-		y <= 0;
-	end else begin
-		if(old_status != ps2_mouse[24]) begin
-			x <= x + ps2_mouse[13:8];
-			y <= y + ps2_mouse[21:16];
+	if (ss_en) {y, x} <= ss_d[28:17];
+	else if (~ss_hold) begin
+		old_status <= ps2_mouse[24];
+
+		if(reset) begin
+			x <= 0;
+			y <= 0;
+		end else begin
+			if(old_status != ps2_mouse[24]) begin
+				x <= x + ps2_mouse[13:8];
+				y <= y + ps2_mouse[21:16];
+			end
 		end
 	end
 end

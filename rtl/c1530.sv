@@ -3,10 +3,18 @@
 // Originally VHDL by Dar (darfpga@aol.fr) 25-Mars-2019
 // tap/wav player - Converted to 8 bit FIFO by Slingshot
 // SystemVerilog conversion for MiSTer
+//
+// Savestate (WP A7): the player and its FIFO are on the scan chain
+// (ss_si -> FIFO -> player -> ss_so, field order in savestate/map.yaml, TAPE).
+// The reset is synchronous so the chain load has priority over it (the reset
+// comes from registers that pass through the chain); everything holds while
+// the engine owns the machine (ss_hold). The FIFO is a plain register FIFO:
+// an Altera scfifo keeps its pointers out of reach.
 //-----------------------------------------------------------------------------
 
 module c1530 (
 	input  logic        clk32,
+	input  logic        ce,           // 0 = machine paused: player, motor momentum and FIFO reads hold
 	input  logic        restart_tape,
 	input  logic        wav_mode,
 	input  logic [1:0]  tap_version,
@@ -18,7 +26,12 @@ module c1530 (
 	output logic        cass_read,
 	input  logic        cass_write,
 	input  logic        cass_motor,
-	output logic        cass_run
+	output logic        cass_run,
+
+	input  logic        ss_en,
+	input  logic        ss_hold,
+	input  logic        ss_si,
+	output logic        ss_so
 );
 
 logic [5:0]  tap_player_tick_cnt;
@@ -37,19 +50,36 @@ logic        cass_motor_D;
 logic        motor;
 logic [23:0] motor_counter;
 
+logic        ss_fifo_so;
+
 tap_fifo tap_fifo_inst (
-	.aclr  (restart_tape),
+	.clr   (restart_tape),
 	.data  (host_tap_in),
 	.clock (clk32),
 	.rdreq (tap_fifo_rdreq),
 	.wrreq (host_tap_wrreq),
 	.q     (tap_fifo_do),
 	.empty (tap_fifo_empty),
-	.full  (tap_fifo_wrfull)
+	.full  (tap_fifo_wrfull),
+
+	.ss_en   (ss_en),
+	.ss_hold (ss_hold),
+	.ss_si   (ss_si),
+	.ss_so   (ss_fifo_so)
 );
 
-always_ff @(posedge clk32 or posedge restart_tape) begin
-	if (restart_tape) begin
+wire [105:0] ss_q = {wave_len, wave_cnt, wav_player_tick_cnt, tap_player_tick_cnt, tap_fifo_rdreq, tap_fifo_error,
+                     start_bytes, skip_bytes, motor_counter, motor, initial_delay, get_24bits_len, cass_read, cass_motor_D};
+wire [105:0] ss_d = {ss_fifo_so, ss_q[105:1]};
+assign ss_so = ss_q[0];
+
+always_ff @(posedge clk32) begin
+	if (ss_en) begin
+		{wave_len, wave_cnt, wav_player_tick_cnt, tap_player_tick_cnt, tap_fifo_rdreq, tap_fifo_error,
+		 start_bytes, skip_bytes, motor_counter, motor, initial_delay, get_24bits_len, cass_read, cass_motor_D} <= ss_d;
+	end else if (ss_hold) begin
+		// the engine owns the machine: nothing moves
+	end else if (restart_tape) begin
 		{start_bytes, skip_bytes, get_24bits_len} <= {8'h00, 1'b1, 1'b0};
 		{tap_player_tick_cnt, wav_player_tick_cnt} <= 18'h00000;
 		wave_len  <= 24'h000004;
@@ -58,6 +88,10 @@ always_ff @(posedge clk32 or posedge restart_tape) begin
 		tap_fifo_rdreq  <= 1'b0;
 		tap_fifo_error  <= 1'b0;
 		{motor, cass_read} <= 2'b11;
+	end else if (~ce) begin
+		// Paused: hold every timer. Only the FIFO read strobe is dropped so a
+		// read requested in the last running cycle is taken exactly once.
+		tap_fifo_rdreq <= 1'b0;
 	end else begin
 		// simulate tape motor momentum
 		cass_motor_D <= cass_motor;
@@ -154,40 +188,58 @@ endmodule
 
 
 //-----------------------------------------------------------------------------
-// Altera scfifo wrapper for c1530 tape data buffer
+// Tape data buffer, 64 x 8, registered output (scfifo with showahead off),
+// in registers so that the whole of it is on the savestate chain:
+// ss_si -> mem[63] ... mem[0] -> wp -> rp -> q -> ss_so.
 //-----------------------------------------------------------------------------
 
 module tap_fifo (
-	input  logic        aclr,
+	input  logic        clr,
 	input  logic        clock,
 	input  logic [7:0]  data,
 	input  logic        rdreq,
 	input  logic        wrreq,
 	output logic        empty,
 	output logic        full,
-	output logic [7:0]  q
+	output logic [7:0]  q,
+
+	input  logic        ss_en,
+	input  logic        ss_hold,
+	input  logic        ss_si,
+	output logic        ss_so
 );
 
-scfifo #(
-	.add_ram_output_register ("OFF"),
-	.intended_device_family  ("Cyclone III"),
-	.lpm_numwords            (64),
-	.lpm_showahead           ("OFF"),
-	.lpm_type                ("scfifo"),
-	.lpm_width               (8),
-	.lpm_widthu              (6),
-	.overflow_checking       ("ON"),
-	.underflow_checking      ("ON"),
-	.use_eab                 ("ON")
-) scfifo_component (
-	.aclr  (aclr),
-	.clock (clock),
-	.data  (data),
-	.rdreq (rdreq),
-	.wrreq (wrreq),
-	.empty (empty),
-	.full  (full),
-	.q     (q)
-);
+logic [511:0] mem;       // byte k at mem[k*8 +: 8]
+logic   [6:0] wp = 0, rp = 0;
+logic   [7:0] q_r = 0;
+wire    [6:0] used = wp - rp;
+
+assign empty = (used == 0);
+assign full  = (used == 7'd64);
+assign q     = q_r;
+
+wire [533:0] ss_q = {mem, wp, rp, q_r};
+wire [533:0] ss_d = {ss_si, ss_q[533:1]};
+assign ss_so = ss_q[0];
+
+always_ff @(posedge clock) begin
+	if (ss_en) begin
+		{mem, wp, rp, q_r} <= ss_d;
+	end else if (ss_hold) begin
+		// the engine owns the machine: nothing moves
+	end else if (clr) begin
+		wp <= 0;
+		rp <= 0;
+	end else begin
+		if (wrreq && !full) begin
+			mem[wp[5:0]*8 +: 8] <= data;
+			wp <= wp + 1'd1;
+		end
+		if (rdreq && !empty) begin
+			q_r <= mem[rp[5:0]*8 +: 8];
+			rp <= rp + 1'd1;
+		end
+	end
+end
 
 endmodule

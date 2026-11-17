@@ -18,6 +18,7 @@
 module tape_subsystem (
 	input         clk,
 	input         ce,
+	input         pause,     // C64 paused (pause_out of fpga64): freezes the C1530 player
 	input         reset_n,
 	input         hblank,
 	input         vblank,
@@ -59,9 +60,24 @@ module tape_subsystem (
 	output [24:0] tap_play_addr,
 	output [24:0] tap_last_addr,
 
+	// Savestate boundary: no TAP prefetch byte in flight (WP A2)
+	output        ss_idle,
+
 	// Overlay color: 0=transparent, 1=green, 2=yellow, 3=red, 4=blue
-	output [2:0]  pixel_color
+	output [2:0]  pixel_color,
+
+	// savestate scan chain (WP A7): ss_si -> c1530 (FIFO, player) ->
+	// tape_counter -> the transport registers here -> ss_so; everything holds
+	// while the engine owns the machine (ss_hold). The TAP image, its time map
+	// and version are media (not in the slot): a load needs the same tape.
+	input         ss_en,
+	input         ss_hold,
+	input         ss_si,
+	output        ss_so
 );
+
+wire ss_c1530_so, ss_tc_so;
+wire [74:0] ss_q, ss_d;   // savestate segment part (layout below)
 
 wire       tap_download = ioctl_download & load_tap;
 wire       tap_reset;
@@ -80,8 +96,11 @@ assign tap_loaded = (|tap_last_addr_r) && tap_ready_gated; // keep mounted at en
 assign tap_at_end = tap_loaded && (tap_play_addr_r >= tap_last_addr_r);
 
 always @(posedge clk) begin
-	if (tap_reset) tap_ready_gated <= 1'b0;
-	else           tap_ready_gated <= tap_ready;
+	if (ss_en) tap_ready_gated <= ss_d[68];
+	else if (!ss_hold) begin
+		if (tap_reset) tap_ready_gated <= 1'b0;
+		else           tap_ready_gated <= tap_ready;
+	end
 end
 
 // TAP version is needed by c1530 while playing back from SDRAM.
@@ -116,7 +135,9 @@ assign ioctl_wait = tap_download & tap_scanner_wait;
 tap_scanner #(.THRESH_BASE(2693), .THRESH_INC(6), .ABS_MAX(8191), .MAP_AW(13)) tap_scanner
 (
 	.clk(clk),
-	.reset_n(reset_n & ~tape_end & ~cmd_unload),
+	// tape_end is on the chain: while it shifts it carries other bits, which
+	// must not wipe the TAP map (not on the chain) or its ready flag
+	.reset_n(reset_n & (ss_hold | ~(tape_end | cmd_unload))),
 	.start(tap_download_start),
 	.tap_wr(ioctl_wr & load_tap),
 	.tap_addr(ioctl_addr),
@@ -174,7 +195,12 @@ tape_counter #(.ABS_MAX(8191)) tape_counter
 	.wind_step(tc_wind_step),
 	.abs_count(tc_abs_count),
 
-	.pixel_color(pixel_color)
+	.pixel_color(pixel_color),
+
+	.ss_en(ss_en),
+	.stop(pause | ss_hold),
+	.ss_si(ss_c1530_so),
+	.ss_so(ss_tc_so)
 );
 
 // --- Transport and C1530 feed control ---
@@ -184,12 +210,28 @@ reg        tape_seek_reset = 1'b0;
 reg  [1:0] tap_wrreq;
 wire       tap_wrfull;
 reg        tape_end;
+reg        read_cyc;
+reg        io_cycleD;
+
+assign ss_idle = ~read_cyc & ~|tap_wrreq;
+
+// savestate segment part, bit 0 leaves first: cass_sense, io_cycleD,
+// read_cyc, tap_last_addr_r, tap_map_rdaddr, tap_map_update,
+// tap_map_update_d, tap_play_addr_r, tap_ready_gated, tap_wrreq, tape_end,
+// tape_ff, tape_rew, tape_seek_reset
+assign ss_q = {tape_seek_reset, tape_rew, tape_ff, tape_end, tap_wrreq, tap_ready_gated, tap_play_addr_r,
+               tap_map_update_d, tap_map_update, tap_map_rdaddr, tap_last_addr_r, read_cyc, io_cycleD, cass_sense};
+assign ss_d = {ss_tc_so, ss_q[74:1]};
+assign ss_so = ss_q[0];
 
 always @(posedge clk) begin
-	reg io_cycleD;
-	reg read_cyc;
 	reg cmd_ff_d, cmd_rew_d, cmd_play_d, cmd_stop_d;
-	
+
+	if (ss_en) begin
+		{tape_seek_reset, tape_rew, tape_ff, tape_end, tap_wrreq} <= ss_d[74:69];
+		{tap_play_addr_r, tap_map_update_d, tap_map_update, tap_map_rdaddr, tap_last_addr_r, read_cyc, io_cycleD, cass_sense} <= ss_d[67:0];
+	end
+	else if (!ss_hold) begin
 	cmd_ff_d <= cmd_ff;
 	cmd_rew_d <= cmd_rew;
 	cmd_play_d <= cmd_play;
@@ -275,11 +317,13 @@ always @(posedge clk) begin
 			tape_seek_reset <= 1'b1;
 		end
 	end
+	end
 end
 
 c1530 c1530
 (
 	.clk32(clk),
+	.ce(~pause),
 	.restart_tape(tap_reset | tape_seek_reset),
 	.wav_mode(1'b0),
 	.tap_version(tap_version),
@@ -291,7 +335,12 @@ c1530 c1530
 	.cass_write(cass_write),
 	.cass_motor(cass_motor),
 	.cass_sense(cass_sense),
-	.cass_run(cass_run)
+	.cass_run(cass_run),
+
+	.ss_en(ss_en),
+	.ss_hold(ss_hold),
+	.ss_si(ss_si),
+	.ss_so(ss_c1530_so)
 );
 
 endmodule

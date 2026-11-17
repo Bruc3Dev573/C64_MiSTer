@@ -72,6 +72,7 @@
 module opl3seq
 (
 	input             clk,
+	input             ce,    // holds the sequencer, also in the middle of a sample
 	input             reset,
 	input             rd, // clk synchronous pulse, read only while <ready> == 1
 	output reg [15:0] A,
@@ -163,12 +164,13 @@ wire [2:0]eg_inc_tab[120] = '{
 sampler sampler_inst
 (
 	.clk(clk),
+	.ce(ce),
 	.index(r_sinaddr),
 	.ampl(env[8:0]),
 	.sample(op_calc1)
 );
 
-always @(posedge clk) begin
+always @(posedge clk) if(ce) begin
 	STATE <= nextSTATE;
 	s_ram_CHindex <= ram_CHindex;
 	s_ram_OPindex <= ram_OPindex;
@@ -462,6 +464,7 @@ endmodule
 module sampler
 (
 	input         clk, 
+	input         ce,
 	input  [12:0] index,
 	input   [8:0] ampl,
 	output [12:0] sample
@@ -479,7 +482,7 @@ reg         log_rng;
 reg  [15:0] isample;
 assign sample = log_rng ? isample[12:0] : 13'd0;
 
-always @(posedge clk) begin
+always @(posedge clk) if(ce) begin
 	logsin <= sin_tab[index];
 	log_rng <= ilog < 6656;
 	isample <= exp_tab[ilog[12:0]];

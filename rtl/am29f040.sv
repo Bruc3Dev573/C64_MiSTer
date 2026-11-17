@@ -28,6 +28,7 @@ module am29f040 #(
 )(
 	input  logic                    clk,
 	input  logic                    reset_n,
+	input  logic                    pause,   // machine stopped (pause or savestate freeze): the flash holds
 
 	input  logic                    ce_n, // strobe, must be active only 1 cycle
 	input  logic                    we_n,
@@ -44,7 +45,17 @@ module am29f040 #(
 	output logic                    mem_we,
 
 	//arbiter
-	output logic                    mem_req
+	output logic                    mem_req,
+
+	// savestate scan chain (WP A7): field order in savestate/map.yaml (CART).
+	// mem_req drives the SDRAM arbitration on every clock: it never shifts,
+	// the chain carries the copy ss_mem_req (follows it until ss_hold),
+	// written back on ss_load_done.
+	input  logic                    ss_en,
+	input  logic                    ss_hold,
+	input  logic                    ss_load_done,
+	input  logic                    ss_si,
+	output logic                    ss_so
 );
 
 localparam int MEM_BYTES   = 1 << ADDR_WIDTH;
@@ -101,6 +112,13 @@ logic [ADDR_WIDTH-1:0] mem_req_addr;
 logic            [7:0] mem_req_out;
 logic [ADDR_WIDTH-1:0] mem_req_cnt;
 logic           [31:0] busy_cnt;
+logic            [2:0] ce_stage;
+logic                  ss_mem_req;
+
+wire [91:0] ss_q = {unlock, state, mem_req_we, mem_req_out, mem_req_cnt, mem_req_addr, ss_mem_req,
+                    dq7_data, dq6_toggle, dq3_data, ce_stage, busy_cnt};
+wire [91:0] ss_d = {ss_si, ss_q[91:1]};
+assign ss_so = ss_q[0];
 
 assign mem_addr = mem_req_addr;
 assign mem_out  = mem_req_out;
@@ -130,10 +148,31 @@ always_comb begin
 	endcase
 end
 
-always_ff @(posedge clk or negedge reset_n) begin
-	logic [2:0] ce_stage;
+always_ff @(posedge clk) begin
+	if (ss_en)         ss_mem_req <= ss_d[38];
+	else if (!ss_hold) ss_mem_req <= mem_req;
+end
 
-	if (!reset_n) begin
+// synchronous reset: the chain load has priority, and nothing (reset
+// included) moves while the machine is stopped
+always_ff @(posedge clk) begin
+	if (ss_en) begin
+		unlock       <= unlock_e'(ss_d[91:89]);
+		state        <= state_e'(ss_d[88:86]);
+		mem_req_we   <= ss_d[85];
+		mem_req_out  <= ss_d[84:77];
+		mem_req_cnt  <= ss_d[76:58];
+		mem_req_addr <= ss_d[57:39];
+		dq7_data     <= ss_d[37];
+		dq6_toggle   <= ss_d[36];
+		dq3_data     <= ss_d[35];
+		ce_stage     <= ss_d[34:32];
+		busy_cnt     <= ss_d[31:0];
+	end
+	else if (pause) begin
+		if (ss_load_done) mem_req <= ss_mem_req;
+	end
+	else if (!reset_n) begin
 		state      <= ST_READ_MEM;
 		unlock     <= U_IDLE;
 		mem_req    <= 0;
@@ -247,6 +286,7 @@ module ez_rom
 (
 	input  logic        clk,
 	input  logic        reset_n,
+	input  logic        pause,
 	input  logic        ce,
 	input  logic        we,
 	input  logic [19:0] addr,
@@ -262,8 +302,18 @@ module ez_rom
 	input  logic [7:0]  mem_in,
 	output logic [7:0]  mem_out,
 	output logic        mem_ce,
-	output logic        mem_we
+	output logic        mem_we,
+
+	// savestate scan chain: ss_si -> rom1 -> rom0 -> mem_rom_sel, mem_req_en,
+	// mem_cycle_q -> ss_so; everything holds while the machine is stopped (pause)
+	input  logic        ss_en,
+	input  logic        ss_hold,
+	input  logic        ss_load_done,
+	input  logic        ss_si,
+	output logic        ss_so
 );
+
+logic ss_rom1_so, ss_rom0_so;
 
 logic  [7:0] dq0_out;
 logic        dq0_oe;
@@ -277,6 +327,7 @@ am29f040 rom0
 (
 	.clk(clk),
 	.reset_n(reset_n),
+	.pause(pause),
 	.ce_n(~ce || addr[19]),
 	.we_n(~we),
 	.addr(addr[18:0]),
@@ -291,7 +342,13 @@ am29f040 rom0
 	.mem_ce(mem0_ce),
 	.mem_we(mem0_we),
 
-	.mem_req(mem0_req)
+	.mem_req(mem0_req),
+
+	.ss_en(ss_en),
+	.ss_hold(ss_hold),
+	.ss_load_done(ss_load_done),
+	.ss_si(ss_rom1_so),
+	.ss_so(ss_rom0_so)
 );
 
 logic  [7:0] dq1_out;
@@ -306,6 +363,7 @@ am29f040 rom1
 (
 	.clk(clk),
 	.reset_n(reset_n),
+	.pause(pause),
 	.ce_n(~ce || ~addr[19]),
 	.we_n(~we),
 	.addr(addr[18:0]),
@@ -320,7 +378,13 @@ am29f040 rom1
 	.mem_ce(mem1_ce),
 	.mem_we(mem1_we),
 
-	.mem_req(mem1_req)
+	.mem_req(mem1_req),
+
+	.ss_en(ss_en),
+	.ss_hold(ss_hold),
+	.ss_load_done(ss_load_done),
+	.ss_si(ss_si),
+	.ss_so(ss_rom1_so)
 );
 
 assign dq_out = addr[19] ? dq1_out : dq0_out;
@@ -330,22 +394,27 @@ assign mem_req = mem0_req | mem1_req;
 
 logic mem_req_en;
 logic mem_cycle_q;
+logic mem_rom_sel;
+wire [2:0] ss_q = {mem_rom_sel, mem_req_en, mem_cycle_q};
+wire [2:0] ss_d = {ss_rom0_so, ss_q[2:1]};
+assign ss_so = ss_q[0];
+
 always_ff @(posedge clk) begin
-	if(~reset_n || ~mem_req) mem_req_en <= 0;
-	else if(mem_req & mem_cycle) mem_req_en <= 1;
-	mem_cycle_q <= mem_cycle;
+	if (ss_en) {mem_rom_sel, mem_req_en, mem_cycle_q} <= ss_d;
+	else if (!pause) begin
+		if(~reset_n || ~mem_req) mem_req_en <= 0;
+		else if(mem_req & mem_cycle) mem_req_en <= 1;
+		mem_cycle_q <= mem_cycle;
+
+		if(mem_oe) begin
+			if(mem0_req && mem1_req) mem_rom_sel <= ~mem_rom_sel;
+			else if(mem0_req) mem_rom_sel <= 0;
+			else if(mem1_req) mem_rom_sel <= 1;
+		end
+	end
 end
 
 assign mem_oe = ~mem_cycle_q & mem_cycle & mem_req_en;
-
-logic mem_rom_sel;
-always_ff @(posedge clk) begin
-	if(mem_oe) begin
-		if(mem0_req && mem1_req) mem_rom_sel <= ~mem_rom_sel;
-		else if(mem0_req) mem_rom_sel <= 0;
-		else if(mem1_req) mem_rom_sel <= 1;
-	end
-end
 
 assign mem_addr = mem_rom_sel ? {1'b1, mem1_addr} : {1'b0, mem0_addr};
 assign mem_out  = mem_rom_sel ?         mem1_out  :         mem0_out;

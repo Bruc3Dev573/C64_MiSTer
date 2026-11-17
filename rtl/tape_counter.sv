@@ -55,7 +55,16 @@ module tape_counter #(
 	output reg        wind_step,
 	output reg [12:0] abs_count,       // absolute counter value (index into time_map)
 
-	output reg  [2:0] pixel_color
+	output reg  [2:0] pixel_color,
+
+	// savestate scan chain (WP A7): tick generators and the counter model.
+	// They hold while the machine is stopped (stop = pause or savestate
+	// freeze): the tape does not move then, and a pause no longer advances the
+	// counter (nor the auto-unload near the end); the overlay is not saved
+	input        ss_en,
+	input        stop,
+	input        ss_si,
+	output       ss_so
 );
 
 // ---------------------------------------------------------------------------
@@ -63,6 +72,12 @@ module tape_counter #(
 // ---------------------------------------------------------------------------
 localparam TICK_DIV   = CLK_HZ / TICK_HZ;   // 32000 at 32 MHz / 1 kHz
 localparam WIND_TICKS = (WIND_MS < 1) ? 1 : WIND_MS;
+
+// savestate segment width: 13 + 3x4 + 2x16 + tick_1k + tick_div + wind_div + wind_step
+localparam TW  = $clog2(TICK_DIV) + 1;
+localparam WW  = $clog2(WIND_TICKS) + 1;
+localparam SSW = 13 + 12 + 32 + 1 + TW + WW + 1;
+wire [SSW-1:0] ss_q, ss_d;
 
 localparam [2:0] C_TRANSPARENT = 3'd0;
 localparam [2:0] C_GREEN       = 3'd2;
@@ -120,12 +135,15 @@ endfunction
 reg [$clog2(TICK_DIV):0] tick_div = 0;
 reg                      tick_1k  = 0;
 always @(posedge clk) begin
-	tick_1k <= 0;
-	if (tick_div >= TICK_DIV[$clog2(TICK_DIV):0] - 1'd1) begin
-		tick_div <= 0;
-		tick_1k  <= 1;
-	end else begin
-		tick_div <= tick_div + 1'd1;
+	if (ss_en) {tick_div, tick_1k} <= ss_d[57+TW:57];
+	else if (!stop) begin
+		tick_1k <= 0;
+		if (tick_div >= TICK_DIV[$clog2(TICK_DIV):0] - 1'd1) begin
+			tick_div <= 0;
+			tick_1k  <= 1;
+		end else begin
+			tick_div <= tick_div + 1'd1;
+		end
 	end
 end
 
@@ -133,15 +151,18 @@ end
 reg [$clog2(WIND_TICKS):0] wind_div  = 0;
 
 always @(posedge clk) begin
-	wind_step <= 0;
-	if (!winding) begin
-		wind_div <= 0;
-	end else if (tick_1k) begin
-		if (wind_div >= WIND_TICKS[$clog2(WIND_TICKS):0] - 1'd1) begin
-			wind_div  <= 0;
-			wind_step <= 1;
-		end else begin
-			wind_div <= wind_div + 1'd1;
+	if (ss_en) {wind_step, wind_div} <= ss_d[SSW-1:58+TW];
+	else if (!stop) begin
+		wind_step <= 0;
+		if (!winding) begin
+			wind_div <= 0;
+		end else if (tick_1k) begin
+			if (wind_div >= WIND_TICKS[$clog2(WIND_TICKS):0] - 1'd1) begin
+				wind_div  <= 0;
+				wind_step <= 1;
+			end else begin
+				wind_div <= wind_div + 1'd1;
+			end
 		end
 	end
 end
@@ -165,7 +186,18 @@ reg [3:0]  d_huns    = 0;
 reg counter_reset_d = 0;
 wire counter_reset_edge = counter_reset & ~counter_reset_d;
 
+// savestate segment part, bit 0 leaves first: abs_count, d_huns, d_ones,
+// d_tens, pos_acc, threshold, tick_1k, tick_div, wind_div, wind_step
+assign ss_q = {wind_step, wind_div, tick_div, tick_1k, threshold, pos_acc, d_tens, d_ones, d_huns, abs_count};
+assign ss_d = {ss_si, ss_q[SSW-1:1]};
+assign ss_so = ss_q[0];
+
 always @(posedge clk) begin
+	if (ss_en) {threshold, pos_acc, d_tens, d_ones, d_huns, abs_count} <= ss_d[56:0];
+	else if (stop) begin
+		// the machine is stopped: nothing moves
+	end
+	else begin
 	counter_reset_d <= counter_reset;
 
 	if (new_tape || !tape_loaded) begin
@@ -212,6 +244,7 @@ always @(posedge clk) begin
 				{d_huns, d_tens, d_ones} <= bcd_dec({d_huns, d_tens, d_ones});
 			end
 		end
+	end
 	end
 end
 

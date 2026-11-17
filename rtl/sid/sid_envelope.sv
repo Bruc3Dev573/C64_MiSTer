@@ -9,7 +9,14 @@ module sid_envelope
 	input     [ 7:0] att_dec,
 	input     [ 7:0] sus_rel,
 
-	output reg [7:0] envelope
+	output reg [7:0] envelope,
+
+	// savestate scan chain: the counters run on ce_1m; the period decode runs
+	// on every clock and holds while the machine is stopped (stop)
+	input            ss_en,
+	input            stop,
+	input            ss_si,
+	output           ss_so
 );
 
 localparam ST_RELEASE  = 0;
@@ -17,6 +24,15 @@ localparam ST_ATTACK   = 1;
 localparam ST_DEC_SUS  = 2;
 
 reg  [1:0] state;
+reg        hold_zero;
+reg  [4:0] exponential_counter_period;
+reg        gate_edge;
+reg [14:0] rate_counter;
+reg  [4:0] exponential_counter;
+
+wire [36:0] ss_q = {rate_counter, hold_zero, gate_edge, exponential_counter_period, exponential_counter, envelope, state};
+wire [36:0] ss_d = {ss_si, ss_q[36:1]};
+assign ss_so = ss_q[0];
 
 wire [14:0] rates[16] = 
 '{
@@ -41,13 +57,7 @@ wire [14:0] rates[16] =
 wire [14:0] rate_period = rates[(state == ST_ATTACK) ? att_dec[7:4] : (state == ST_DEC_SUS) ? att_dec[3:0] : sus_rel[3:0]];
 
 always @(posedge clock) begin
-	reg        hold_zero;
-	reg  [4:0] exponential_counter_period;
-	reg        gate_edge;
-	reg [14:0] rate_counter;
-	reg  [4:0] exponential_counter;
-
-	case(envelope)
+	if (!stop) case(envelope)
 		'hff: exponential_counter_period <= 0;
 		'h5d: exponential_counter_period <= 1;
 		'h36: exponential_counter_period <= 3;
@@ -104,6 +114,7 @@ always @(posedge clock) begin
 		end
 		if (gate_edge & ~gate) state <= ST_RELEASE;
 	end
+	if (ss_en) {rate_counter, hold_zero, gate_edge, exponential_counter_period, exponential_counter, envelope, state} <= ss_d;
 end
 
 endmodule

@@ -41,7 +41,15 @@ module floppy (
 	output       sector_data,  // valid sector data under head
 	       
 	output       ready,        // drive is ready, data can be read
-	output reg   index
+	output reg   index,
+
+	// savestate (WP A10, docs/SAVESTATES.md): the fl_ fields of DRV8_1581 /
+	// DRV9_1581, ss_si in at the top, bit 0 (index_pulse_cnt[0]) out first;
+	// every process holds while stop is high (drive stopped with the machine)
+	input        stop,
+	input        ss_en,
+	input        ss_si,
+	output       ss_so
 );
 
 // The sysclock is the value all floppy timings are derived from. 
@@ -77,6 +85,25 @@ localparam BPTHD = RATEHD*60/(8*RPM);
 // report disk ready if it spins at full speed
 assign ready = select && (rate == (fm ? RATESD : hd ? RATEHD : RATEDD));
 
+// savestate: one sub-segment per process, ss_si -> dc -> sp -> be -> bc ->
+// sec -> trk -> ix -> ss_so
+wire [19:0] ss_q_ix  = {index, index_pulse_cnt};
+wire [28:0] ss_q_trk = {current_track, step_busy, step_outD, step_inD};
+wire [16:0] ss_q_sec = {current_sector, sec_byte_cnt, sec_state};
+wire [15:0] ss_q_bc  = {index_pulse_start, byte_cnt};
+wire  [3:0] ss_q_be  = {clk_cnt2, byte_clk_en};
+wire [64:0] ss_q_sp  = {rate, spin_up_counter, motor_onD};
+wire [33:0] ss_q_dc  = {clk_cnt, data_clk, data_clk_en};
+
+wire [19:0] ss_d_ix  = {ss_q_trk[0], ss_q_ix[19:1]};
+wire [28:0] ss_d_trk = {ss_q_sec[0], ss_q_trk[28:1]};
+wire [16:0] ss_d_sec = {ss_q_bc[0],  ss_q_sec[16:1]};
+wire [15:0] ss_d_bc  = {ss_q_be[0],  ss_q_bc[15:1]};
+wire  [3:0] ss_d_be  = {ss_q_sp[0],  ss_q_be[3:1]};
+wire [64:0] ss_d_sp  = {ss_q_dc[0],  ss_q_sp[64:1]};
+wire [33:0] ss_d_dc  = {ss_si,       ss_q_dc[33:1]};
+assign ss_so = ss_q_ix[0];
+
 // ================================================================
 // ========================= INDEX PULSE ==========================
 // ================================================================
@@ -85,14 +112,17 @@ assign ready = select && (rate == (fm ? RATESD : hd ? RATEHD : RATEDD));
 // and lasts INDEX_PULSE_CYCLES system clock cycles
 localparam INDEX_PULSE_CYCLES = INDEX_PULSE_LEN * CLK_EN;
 reg [18:0] index_pulse_cnt;
-always @(posedge clk) if(clk8m_en) begin
-	if(index_pulse_start && (index_pulse_cnt == INDEX_PULSE_CYCLES-1)) begin
-		index <= 1'b0;
-		index_pulse_cnt <= 19'd0;
-	end else if(index_pulse_cnt == INDEX_PULSE_CYCLES-1)
-		index <= 1'b1;
-	else
-		index_pulse_cnt <= index_pulse_cnt + 1'd1;
+always @(posedge clk) begin
+	if (ss_en) {index, index_pulse_cnt} <= ss_d_ix;
+	else if(clk8m_en & ~stop) begin
+		if(index_pulse_start && (index_pulse_cnt == INDEX_PULSE_CYCLES-1)) begin
+			index <= 1'b0;
+			index_pulse_cnt <= 19'd0;
+		end else if(index_pulse_cnt == INDEX_PULSE_CYCLES-1)
+			index <= 1'b1;
+		else
+			index_pulse_cnt <= index_pulse_cnt + 1'd1;
+	end
 end
 
 // ================================================================
@@ -109,22 +139,25 @@ reg step_outD;
 reg [19:0] step_busy /* verilator public */;
    
 always @(posedge clk) begin
-	step_inD <= step_in;
-	step_outD <= step_out;
+	if (ss_en) {current_track, step_busy, step_outD, step_inD} <= ss_d_trk;
+	else if (~stop) begin
+		step_inD <= step_in;
+		step_outD <= step_out;
 
-	if(clk8m_en && step_busy != 0)
-		step_busy <= step_busy - 18'd1;
+		if(clk8m_en && step_busy != 0)
+			step_busy <= step_busy - 18'd1;
 
-	if(select) begin
-		// rising edge of step signal starts step
-		if(step_in && !step_inD) begin
-			if(current_track != 0) current_track <= current_track - 7'd1;
-				step_busy <= STEP_BUSY_CLKS[19:0];
-		end
+		if(select) begin
+			// rising edge of step signal starts step
+			if(step_in && !step_inD) begin
+				if(current_track != 0) current_track <= current_track - 7'd1;
+					step_busy <= STEP_BUSY_CLKS[19:0];
+			end
 
-		if(step_out && !step_outD) begin
-			if(current_track != TRACKS-1) current_track <= current_track + 7'd1;
-				step_busy <= STEP_BUSY_CLKS[19:0];
+			if(step_out && !step_outD) begin
+				if(current_track != TRACKS-1) current_track <= current_track + 7'd1;
+					step_busy <= STEP_BUSY_CLKS[19:0];
+			end
 		end
 	end
 end
@@ -151,7 +184,8 @@ reg [9:0] sec_byte_cnt;  // counting bytes within sectors
 reg [4:0] current_sector = 4'd1;
   
 always @(posedge clk) begin
-	if (byte_clk_en) begin
+	if (ss_en) {current_sector, sec_byte_cnt, sec_state} <= ss_d_sec;
+	else if (byte_clk_en & ~stop) begin
 		if(index_pulse_start) begin
 			sec_byte_cnt <= sector_gap_len-1'd1;
 			sec_state <= SECTOR_STATE_GAP;     // track starts with gap
@@ -197,7 +231,8 @@ end
 reg [14:0] byte_cnt;
 reg 	   index_pulse_start;
 always @(posedge clk) begin
-	if (byte_clk_en) begin
+	if (ss_en) {index_pulse_start, byte_cnt} <= ss_d_bc;
+	else if (byte_clk_en & ~stop) begin
 		index_pulse_start <= 1'b0;
 
 		if(byte_cnt == ((fm ? BPTSD : hd ? BPTHD : BPTDD)-1'd1)) begin
@@ -214,10 +249,13 @@ assign dclk_en = byte_clk_en;
 reg byte_clk_en;
 reg [2:0] clk_cnt2;
 always @(posedge clk) begin
-	byte_clk_en <= 0;
-	if (data_clk_en) begin
-		clk_cnt2 <= clk_cnt2 + 1'd1;
-		if (clk_cnt2 == 3'b011) byte_clk_en <= 1;
+	if (ss_en) {clk_cnt2, byte_clk_en} <= ss_d_be;
+	else if (~stop) begin
+		byte_clk_en <= 0;
+		if (data_clk_en) begin
+			clk_cnt2 <= clk_cnt2 + 1'd1;
+			if (clk_cnt2 == 3'b011) byte_clk_en <= 1;
+		end
 	end
 end
 
@@ -239,30 +277,33 @@ reg [31:0] rate /* verilator public */ = 0;
 reg motor_onD;
 
 always @(posedge clk) begin
-	motor_onD <= motor_on_sel;
+	if (ss_en) {rate, spin_up_counter, motor_onD} <= ss_d_sp;
+	else if (~stop) begin
+		motor_onD <= motor_on_sel;
 
-	// reset spin_up counter whenever motor state changes
-	if(motor_onD != motor_on_sel)
-		spin_up_counter <= 32'd0;
-	else if(clk8m_en) begin
-		spin_up_counter <= spin_up_counter + (fm ? RATESD : hd ? RATEHD : RATEDD);
+		// reset spin_up counter whenever motor state changes
+		if(motor_onD != motor_on_sel)
+			spin_up_counter <= 32'd0;
+		else if(clk8m_en) begin
+			spin_up_counter <= spin_up_counter + (fm ? RATESD : hd ? RATEHD : RATEDD);
       
-		if(motor_on_sel) begin
-			// spinning up
-			if(spin_up_counter > SPIN_UP_CLKS) begin
-				if(rate < (fm ? RATESD : hd ? RATEHD : RATEDD))
-					rate <= rate + 32'd1;
-				spin_up_counter <= spin_up_counter - (SPIN_UP_CLKS - (fm ? RATESD : hd ? RATEHD : RATEDD));
-			end
-		end else begin
-			// spinning down
-			if(spin_up_counter > SPIN_DOWN_CLKS) begin
-				if(rate > 0)
-					rate <= rate - 32'd1;
-				spin_up_counter <= spin_up_counter - (SPIN_DOWN_CLKS - (fm ? RATESD : hd ? RATEHD : RATEDD));
-			end
-		end // else: !if(motor_on)
-	end // else: !if(motor_onD != motor_on)
+			if(motor_on_sel) begin
+				// spinning up
+				if(spin_up_counter > SPIN_UP_CLKS) begin
+					if(rate < (fm ? RATESD : hd ? RATEHD : RATEDD))
+						rate <= rate + 32'd1;
+					spin_up_counter <= spin_up_counter - (SPIN_UP_CLKS - (fm ? RATESD : hd ? RATEHD : RATEDD));
+				end
+			end else begin
+				// spinning down
+				if(spin_up_counter > SPIN_DOWN_CLKS) begin
+					if(rate > 0)
+						rate <= rate - 32'd1;
+					spin_up_counter <= spin_up_counter - (SPIN_DOWN_CLKS - (fm ? RATESD : hd ? RATEHD : RATEDD));
+				end
+			end // else: !if(motor_on)
+		end // else: !if(motor_onD != motor_on)
+	end
 end
 
 // Generate a data clock from the system clock. This depends on motor
@@ -272,14 +313,17 @@ reg data_clk;
 reg data_clk_en;
 reg [31:0] clk_cnt;
 always @(posedge clk) begin
-	data_clk_en <= 0;
-	if(clk8m_en) begin
-		if(clk_cnt + rate > CLK_EN*1000/2) begin
-			clk_cnt <= clk_cnt - (CLK_EN*1000/2 - rate);
-			data_clk <= !data_clk;
-			if (~data_clk) data_clk_en <= 1;
-		end else
-			clk_cnt <= clk_cnt + rate;
+	if (ss_en) {clk_cnt, data_clk, data_clk_en} <= ss_d_dc;
+	else if (~stop) begin
+		data_clk_en <= 0;
+		if(clk8m_en) begin
+			if(clk_cnt + rate > CLK_EN*1000/2) begin
+				clk_cnt <= clk_cnt - (CLK_EN*1000/2 - rate);
+				data_clk <= !data_clk;
+				if (~data_clk) data_clk_en <= 1;
+			end else
+				clk_cnt <= clk_cnt + rate;
+		end
 	end
 end
 

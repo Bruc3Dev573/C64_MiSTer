@@ -57,7 +57,22 @@ module fdc1772 (
 	output     [7:0] sd_din,
 	input            sd_dout_strobe,
 	output     [7:0] track_out,   // track for OSD
-	output           we_out       // we for OSD
+	output           we_out,      // we for OSD
+
+	// savestate (WP A10, docs/SAVESTATES.md): ss_si -> WD1772 -> floppy -> ss_so
+	// (fdc_ and fl_ fields of DRV8_1581/DRV9_1581). stop (the drive is stopped
+	// with the machine) holds every process but the SD port of the sector
+	// buffer, which ss_hold gives to the engine (region FDC_BUF)
+	input            stop,
+	input            ss_en,
+	input            ss_si,
+	output           ss_so,
+	output           ss_idle,     // no SD request pending, none starting on the next clock
+	input            ss_hold,
+	input      [9:0] ss_addr,
+	input      [7:0] ss_wdata,
+	input            ss_wr,
+	output     [7:0] ss_rgn_q
 );
 
 assign track_out = track;
@@ -213,10 +228,6 @@ end
 // -------------------------------------------------------------------------
 reg cpu_selD;
 reg cpu_rwD;
-always @(posedge clkcpu) begin
-	cpu_rwD <= cpu_sel & ~cpu_rw;
-	cpu_selD <= cpu_sel;
-end
 
 wire cpu_we = cpu_sel & ~cpu_rw & ~cpu_rwD;
 
@@ -224,27 +235,28 @@ reg irq_set;
 
 // floppy_reset and read of status register/write of command register clears irq
 reg cpu_rw_cmdstatus;
-always @(posedge clkcpu)
-  cpu_rw_cmdstatus <= ~cpu_selD && cpu_sel && cpu_addr == FDC_REG_CMDSTATUS;
-
 wire irq_clr = !floppy_reset || cpu_rw_cmdstatus;
-
-always @(posedge clkcpu) begin
-	if(irq_clr) irq <= 1'b0;
-	else if(irq_set) irq <= 1'b1;
-end
 
 reg drq_set;
 
 reg cpu_rw_data;
-always @(posedge clkcpu)
-	cpu_rw_data <= ~cpu_selD && cpu_sel && cpu_addr == FDC_REG_DATA;
-
 wire drq_clr = !floppy_reset || cpu_rw_data;
 
+// bus edge detectors and the irq/drq flags: one process (savestate sub-segment)
 always @(posedge clkcpu) begin
-	if(drq_clr) drq <= 1'b0;
-	else if(drq_set) drq <= 1'b1;
+	if (ss_en) {drq, irq, cpu_rw_data, cpu_rw_cmdstatus, cpu_selD, cpu_rwD} <= ss_d_bus;
+	else if (~stop) begin
+		cpu_rwD <= cpu_sel & ~cpu_rw;
+		cpu_selD <= cpu_sel;
+		cpu_rw_cmdstatus <= ~cpu_selD && cpu_sel && cpu_addr == FDC_REG_CMDSTATUS;
+		cpu_rw_data <= ~cpu_selD && cpu_sel && cpu_addr == FDC_REG_DATA;
+
+		if(irq_clr) irq <= 1'b0;
+		else if(irq_set) irq <= 1'b1;
+
+		if(drq_clr) drq <= 1'b0;
+		else if(drq_set) drq <= 1'b1;
+	end
 end
 
 // -------------------------------------------------------------------------
@@ -258,6 +270,11 @@ wire [4:0] fdn_sector[FD_NUM];
 wire       fdn_sector_hdr[FD_NUM];
 wire       fdn_sector_data[FD_NUM];
 wire       fdn_dclk[FD_NUM];
+
+// savestate: the WD1772 part -> floppy FD_NUM-1 -> ... -> floppy 0 -> ss_so
+wire [FD_NUM:0] fl_c;
+assign fl_c[FD_NUM] = ss_q_bus[0];
+assign ss_so        = fl_c[0];
 
 generate
 	genvar i;
@@ -290,7 +307,12 @@ generate
 			.sector_hdr  ( fdn_sector_hdr[i]  ),
 			.sector_data ( fdn_sector_data[i] ),
 			.ready       ( fdn_ready[i]       ),
-			.index       ( fdn_index[i]       )
+			.index       ( fdn_index[i]       ),
+
+			.stop        ( stop               ),
+			.ss_en       ( ss_en              ),
+			.ss_si       ( fl_c[i+1]          ),
+			.ss_so       ( fl_c[i]            )
 		);
 	end
 endgenerate
@@ -381,13 +403,19 @@ reg track_inc_strobe;
 reg track_dec_strobe;
 reg track_clear_strobe;
 
-always @(posedge clkcpu) begin
-	reg [1:0] seek_state;
-	reg notready_wait;
-	reg sector_not_found;
-	reg irq_at_index;
-	reg [1:0] data_transfer_state;
+// main state machine (savestate sub-segment fsm, its registers at module scope)
+reg [1:0] seek_state;
+reg notready_wait;
+reg sector_not_found;
+reg irq_at_index;
+reg [1:0] data_transfer_state;
 
+always @(posedge clkcpu) begin
+	if (ss_en) {indexD, motor_timeout_index, motor_spin_up_sequence, step_dir, delay_cnt, step_rate_cnt, step_pulse_cnt,
+	            RNF, data_transfer_state, irq_at_index, sector_not_found, notready_wait, seek_state, data_transfer_start,
+	            sd_card_write, sd_card_read, step_out, step_in, busy, motor_on, irq_set,
+	            track_clear_strobe, track_dec_strobe, track_inc_strobe, sector_inc_strobe} <= ss_d_fsm;
+	else if (~stop) begin
 	sector_inc_strobe <= 1'b0;
 	track_inc_strobe <= 1'b0;
 	track_dec_strobe <= 1'b0;
@@ -702,6 +730,7 @@ always @(posedge clkcpu) begin
 		end
 		if(busy) motor_timeout_index <= 0;
 	end
+	end
 end
 
 // floppy delivers data at a floppy generated rate (usually 250kbit/s), so the start and stop
@@ -731,20 +760,23 @@ always @(*) begin
 		fifo_cpuptr_adj = fifo_cpuptr[9:0];
 end
 
+// port a: SD side, the engine's (region FDC_BUF) while it owns the machine (no
+// SD transfer then); port b: drive side, writes only while the drive runs
 fdc1772_dpram #(8, 10) fifo
 (
 	.clock(clkcpu),
 
-	.address_a(fifo_sdptr),
-	.data_a(sd_dout),
-	.wren_a(sd_dout_strobe & sd_ack),
+	.address_a(ss_hold ? ss_addr : fifo_sdptr),
+	.data_a(ss_hold ? ss_wdata : sd_dout),
+	.wren_a(ss_hold ? ss_wr : sd_dout_strobe & sd_ack),
 	.q_a(sd_din),
 
 	.address_b(fifo_cpuptr_adj),
 	.data_b(data_in),
-	.wren_b(data_in_strobe),
+	.wren_b(data_in_strobe & ~stop),
 	.q_b(fifo_q)
 );
+assign ss_rgn_q = sd_din;
 
 // ------------------ SD card control ------------------------
 localparam SD_IDLE = 0;
@@ -755,11 +787,17 @@ reg [1:0] sd_state;
 reg       sd_card_write;
 reg       sd_card_read;
 
-always @(posedge clkcpu) begin
-	reg sd_ackD;
-	reg sd_card_readD;
-	reg sd_card_writeD;
+// The request handshake holds with the drive like the rest (c1581_drv shows
+// the requests to the host only while the drive runs): a transfer the host
+// does while the machine is stopped is seen when it runs again, or repeated
+// if the whole acknowledge fell into the stop.
+reg sd_ackD;
+reg sd_card_readD;
+reg sd_card_writeD;
 
+always @(posedge clkcpu) begin
+	if (ss_en) {sd_ackD, sd_card_writeD, sd_card_readD, s_odd, sd_state, sd_wr, sd_rd} <= ss_d_sd;
+	else if (~stop) begin
 	sd_card_readD <= sd_card_read;
 	sd_card_writeD <= sd_card_write;
 	sd_ackD <= sd_ack;
@@ -801,7 +839,14 @@ always @(posedge clkcpu) begin
 
 	default: ;
 	endcase
+	end
 end
+
+// savestate boundary: no request to the host pending and none starting on the
+// sampling edge; one starting on the last running clock after it (the drive
+// stops one clock after c64_pause) stays hidden from the host while the drive
+// is stopped (c1581_drv masks sd_rd/sd_wr with ~stop)
+assign ss_idle = ~|sd_rd & ~|sd_wr & ~(sd_card_read & ~sd_card_readD) & ~(sd_card_write & ~sd_card_writeD);
 
 // -------------------- CPU data read/write -----------------------
 reg data_in_strobe;
@@ -824,12 +869,15 @@ function [15:0] crc;
 	end
 endfunction
 
-always @(posedge clkcpu) begin
-	reg        data_transfer_startD;
-	reg [10:0] data_transfer_cnt;
-	reg [15:0] crcval;
-	reg        crc_en;
+reg        data_transfer_startD;
+reg [10:0] data_transfer_cnt;
+reg [15:0] crcval;
+reg        crc_en;
 
+always @(posedge clkcpu) begin
+	if (ss_en) {data_lost, data_in_strobe, data_transfer_startD, data_transfer_done, drq_set, fifo_cpuptr,
+	            data_transfer_cnt, data_in_valid, data_out, crcval, crc_en} <= ss_d_dat;
+	else if (~stop) begin
 	crc_en <= 0;
 	if(crc_en) crcval <= crc(crcval, data_out);
 
@@ -909,6 +957,7 @@ always @(posedge clkcpu) begin
 				data_transfer_done <= 1'b1;
 		end
 	end
+	end
 end
 
 // the status byte
@@ -961,6 +1010,8 @@ reg cmd_rx /* verilator public */;
 reg cmd_rx_i;
 
 always @(posedge clkcpu) begin
+	if (ss_en) {data_in, step_to, cmd_rx, cmd_rx_i, sector, track, cmd} <= ss_d_cmd;
+	else if (~stop) begin
 	if(!floppy_reset) begin
 		// clear internal registers
 		cmd <= 8'h00;
@@ -1041,7 +1092,27 @@ always @(posedge clkcpu) begin
 		if (track_dec_strobe) track <= track - 1'd1;
 		if (track_clear_strobe) track <= 8'd0;
 	end
+	end
 end
+
+// savestate chain of the WD1772 part, one sub-segment per process; bit 0
+// leaves first after the floppy fields: bus, sd, fsm, dat, cmd (ss_si in at
+// the top of cmd)
+wire  [5:0] ss_q_bus = {drq, irq, cpu_rw_data, cpu_rw_cmdstatus, cpu_selD, cpu_rwD};
+wire  [7:0] ss_q_sd  = {sd_ackD, sd_card_writeD, sd_card_readD, s_odd, sd_state, sd_wr, sd_rd};
+wire [85:0] ss_q_fsm = {indexD, motor_timeout_index, motor_spin_up_sequence, step_dir, delay_cnt, step_rate_cnt, step_pulse_cnt,
+                        RNF, data_transfer_state, irq_at_index, sector_not_found, notready_wait, seek_state, data_transfer_start,
+                        sd_card_write, sd_card_read, step_out, step_in, busy, motor_on, irq_set,
+                        track_clear_strobe, track_dec_strobe, track_inc_strobe, sector_inc_strobe};
+wire [52:0] ss_q_dat = {data_lost, data_in_strobe, data_transfer_startD, data_transfer_done, drq_set, fifo_cpuptr,
+                        data_transfer_cnt, data_in_valid, data_out, crcval, crc_en};
+wire [41:0] ss_q_cmd = {data_in, step_to, cmd_rx, cmd_rx_i, sector, track, cmd};
+
+wire  [5:0] ss_d_bus = {ss_q_sd[0],  ss_q_bus[5:1]};
+wire  [7:0] ss_d_sd  = {ss_q_fsm[0], ss_q_sd[7:1]};
+wire [85:0] ss_d_fsm = {ss_q_dat[0], ss_q_fsm[85:1]};
+wire [52:0] ss_d_dat = {ss_q_cmd[0], ss_q_dat[52:1]};
+wire [41:0] ss_d_cmd = {ss_si,       ss_q_cmd[41:1]};
 
 endmodule
 

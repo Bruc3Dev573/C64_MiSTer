@@ -45,7 +45,22 @@ module c1541_logic
 	input        byte_n,		   // byte ready
 	input        wps_n,		   // write-protect sense
 	input        tr00_sense_n,	// track 0 sense
-	output       act			   // activity LED
+	output       act,			   // activity LED
+
+	// savestate (WP A8): chain T65 -> VIA1 (UC1) -> VIA2 (UC3) (bit 0 out
+	// first: VIA2), RAM regions on port a while the engine owns the machine
+	input        stop,          // drive stopped with the machine
+	input        ss_en,
+	input        ss_hold,
+	input        ss_si,
+	output       ss_so,
+	output       cpu_sync,      // drive CPU between instructions
+	input [12:0] ss_addr,
+	input  [7:0] ss_wdata,
+	input        ss_wr_ram,
+	input        ss_wr_extram,
+	output [7:0] ss_ram_q,
+	output [7:0] ss_extram_q
 );
 
 assign rom_addr = cpu_a[14:0];
@@ -72,11 +87,13 @@ wire        cpu_rw;
 wire        cpu_irq_n = ~(uc1_irq | uc3_irq);
 wire        cpu_so_n = byte_n | ~soe;
 
+wire ss_cpu_so, ss_uc1_so;
+
 T65 cpu
 (
 	.mode(2'b00),
 	.res_n(~reset),
-	.enable(ph2_f),
+	.enable(ph2_f & ~stop),   // T65 SS_Hold freezes only its SO sampler: a ph2_f held while stopped, or a chain bit passing through it, must not step the CPU
 	.clk(clk),
 	.rdy(1'b1),
 	.abort_n(1'b1),
@@ -84,9 +101,15 @@ T65 cpu
 	.nmi_n(1'b1),
 	.so_n(cpu_so_n),
 	.r_w_n(cpu_rw),
+	.sync(cpu_sync),
 	.A(cpu_a),
 	.DI(cpu_di),
-	.DO(cpu_do)
+	.DO(cpu_do),
+
+	.SS_En(ss_en),
+	.SS_Hold(stop),
+	.SS_SI(ss_si),
+	.SS_SO(ss_cpu_so)
 );
 
 wire extram_cs = ext_en && (cpu_a[15:13] == 'b100);
@@ -95,9 +118,10 @@ wire [7:0] extram_do;
 iecdrv_mem #(8,13) extram
 (
 	.clock_a(clk),
-	.address_a(cpu_a[12:0]),
-	.data_a(cpu_do),
-	.wren_a(ph2_r & ~cpu_rw & extram_cs),
+	.address_a(ss_hold ? ss_addr : cpu_a[12:0]),
+	.data_a(ss_hold ? ss_wdata : cpu_do),
+	.wren_a(ss_hold ? ss_wr_extram : (ph2_r & ~stop & ~cpu_rw & extram_cs)),
+	.q_a(ss_extram_q),
 
 	.clock_b(clk),
 	.address_b(cpu_a[12:0]),
@@ -108,9 +132,10 @@ wire [7:0] ram_do;
 iecdrv_mem #(8,11) ram
 (
 	.clock_a(clk),
-	.address_a(cpu_a[10:0]),
-	.data_a(cpu_do),
-	.wren_a(ph2_r & ~cpu_rw & ram_cs),
+	.address_a(ss_hold ? ss_addr[10:0] : cpu_a[10:0]),
+	.data_a(ss_hold ? ss_wdata : cpu_do),
+	.wren_a(ss_hold ? ss_wr_ram : (ph2_r & ~stop & ~cpu_rw & ram_cs)),
+	.q_a(ss_ram_q),
 
 	.clock_b(clk),
 	.address_b(cpu_a[10:0]),
@@ -172,7 +197,12 @@ iecdrv_via6522 uc1
 	.cb2_t(uc1_cb2_oe),
 	.cb2_i(uc1_cb2_o | ~uc1_cb2_oe),
 
-	.irq(uc1_irq)
+	.irq(uc1_irq),
+
+	.ss_en(ss_en),
+	.ss_stop(stop),
+	.ss_si(ss_cpu_so),
+	.ss_so(ss_uc1_so)
 );
 
 
@@ -235,7 +265,12 @@ iecdrv_via6522 uc3
 	.cb2_t(uc3_cb2_oe),
 	.cb2_i(uc3_cb2_o | ~uc3_cb2_oe),
 
-	.irq(uc3_irq)
+	.irq(uc3_irq),
+
+	.ss_en(ss_en),
+	.ss_stop(stop),
+	.ss_si(ss_uc1_so),
+	.ss_so(ss_so)
 );
 
 endmodule

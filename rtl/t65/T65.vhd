@@ -159,7 +159,15 @@ entity T65 is
     -- 6502 registers (MSB) PC, SP, P, Y, X, A (LSB)
     Regs    : out std_logic_vector(63 downto 0);
     DEBUG   : out T_t65_dbg;
-    NMI_ack : out std_logic
+    NMI_ack : out std_logic;
+    -- savestate scan chain (C64 core WP A3, docs/SAVESTATES.md). SS_En shifts
+    -- every register of the core by one bit (SS_SI in at the top, bit 0 out
+    -- on SS_SO); SS_Hold (savestate engine owns the stopped machine) freezes
+    -- the only logic not gated by Enable, the SO pin sampler.
+    SS_En   : in  std_logic := '0';
+    SS_Hold : in  std_logic := '0';
+    SS_SI   : in  std_logic := '0';
+    SS_SO   : out std_logic
   );
 end T65;
 
@@ -186,6 +194,11 @@ architecture rtl of T65 is
 
   signal Mode_r             : std_logic_vector(1 downto 0);
   signal BCD_en_r           : std_logic;
+  -- the three micro-code registers are stored as vectors ('pos of the enum):
+  -- a scan-chain cell must hold any bit pattern while the chain shifts
+  signal ALU_Op_r_v         : std_logic_vector(4 downto 0);
+  signal Write_Data_r_v     : std_logic_vector(3 downto 0);
+  signal Set_Addr_To_r_v    : std_logic_vector(1 downto 0);
   signal ALU_Op_r           : T_ALU_Op;
   signal Write_Data_r       : T_Write_Data;
   signal Set_Addr_To_r      : T_Set_Addr_To;
@@ -249,6 +262,42 @@ architecture rtl of T65 is
 
   signal NMI_entered    : std_logic;
 
+  -- savestate scan chain, bit 0 leaves first (field order of savestate/map.yaml, segment CPU after the 6510 port)
+  constant SS_BITS          : natural := 177;
+  signal ss_q, ss_d         : std_logic_vector(SS_BITS-1 downto 0);
+
+  function ss_v(x : T_ALU_Op) return std_logic_vector is
+  begin
+    return std_logic_vector(to_unsigned(T_ALU_Op'pos(x), 5));
+  end function;
+  function ss_v(x : T_Write_Data) return std_logic_vector is
+  begin
+    return std_logic_vector(to_unsigned(T_Write_Data'pos(x), 4));
+  end function;
+  function ss_v(x : T_Set_Addr_To) return std_logic_vector is
+  begin
+    return std_logic_vector(to_unsigned(T_Set_Addr_To'pos(x), 2));
+  end function;
+  -- out-of-range patterns only occur while the chain shifts (machine stopped)
+  function ss_alu(v : std_logic_vector(4 downto 0)) return T_ALU_Op is
+    variable i : natural range 0 to 31;
+  begin
+    i := to_integer(unsigned(v));
+    if i > T_ALU_Op'pos(T_ALU_Op'high) then i := 0; end if;
+    return T_ALU_Op'val(i);
+  end function;
+  function ss_wd(v : std_logic_vector(3 downto 0)) return T_Write_Data is
+    variable i : natural range 0 to 15;
+  begin
+    i := to_integer(unsigned(v));
+    if i > T_Write_Data'pos(T_Write_Data'high) then i := 0; end if;
+    return T_Write_Data'val(i);
+  end function;
+  function ss_sat(v : std_logic_vector(1 downto 0)) return T_Set_Addr_To is
+  begin
+    return T_Set_Addr_To'val(to_integer(unsigned(v)));
+  end function;
+
 begin
   -- NMI_ack pulses one cycle during stack push so that an external cartridge that
   -- watches it (e.g. a SIMCRT freezer state machine) can switch into ULTIMAX mode
@@ -278,6 +327,19 @@ begin
   DEBUG.P <= P;
 
   Regs <= std_logic_vector(PC) & std_logic_vector(S)& P & Y(7 downto 0) & X(7 downto 0) & ABC(7 downto 0);
+
+  ALU_Op_r      <= ss_alu(ALU_Op_r_v);
+  Write_Data_r  <= ss_wd(Write_Data_r_v);
+  Set_Addr_To_r <= ss_sat(Set_Addr_To_r_v);
+
+  -- Res_n_i/Res_n_d are not on the chain: they are the asynchronous reset of
+  -- every register below and are 1 at an instruction boundary (Sync).
+  ss_q <= XF_i & WRn_i & Write_Data_r_v & SO_n_o & Set_Addr_To_r_v & std_logic_vector(S) & RstCycle & rdy_mod &
+          std_logic_vector(PC) & PBR & P & NMIReq & NMICycle & NMIAct & NMI_n_o & NMI_entered & Mode_r & MF_i &
+          MCycle & IRQReq & IRQCycle & IRQ_n_o & IR & EF_i & DL & Y(7 downto 0) & X(7 downto 0) & ABC(7 downto 0) &
+          DBR & BusB_r & BusB & BusA_r & BCD_en_r & BAL & BAH & ALU_Op_r_v & AD;
+  ss_d  <= SS_SI & ss_q(SS_BITS-1 downto 1);
+  SS_SO <= ss_q(0);
 
   mcode : entity work.T65_MCode
     port map(
@@ -352,9 +414,9 @@ begin
 
       Mode_r <= (others => '0');
       BCD_en_r <= '1';
-      ALU_Op_r <= ALU_OP_BIT;
-      Write_Data_r <= Write_Data_DL;
-      Set_Addr_To_r <= Set_Addr_To_PBR;
+      ALU_Op_r_v <= ss_v(ALU_OP_BIT);
+      Write_Data_r_v <= ss_v(Write_Data_DL);
+      Set_Addr_To_r_v <= ss_v(Set_Addr_To_PBR);
 
       WRn_i <= '1';
       EF_i <= '1';
@@ -409,12 +471,12 @@ begin
             end if;
           end if;
 
-          ALU_Op_r <= ALU_Op;
-          Write_Data_r <= Write_Data;
+          ALU_Op_r_v <= ss_v(ALU_Op);
+          Write_Data_r_v <= ss_v(Write_Data);
           if Break = '1' then
-            Set_Addr_To_r <= Set_Addr_To_PBR;
+            Set_Addr_To_r_v <= ss_v(Set_Addr_To_PBR);
           else
-            Set_Addr_To_r <= Set_Addr_To;
+            Set_Addr_To_r_v <= ss_v(Set_Addr_To);
           end if;
 
           if Inc_S = '1' then
@@ -447,6 +509,25 @@ begin
             when others => null;
           end case;
         end if;
+      end if;
+      if SS_En = '1' then
+        PC <= unsigned(ss_d(149 downto 134));
+        IR <= ss_d(103 downto 96);
+        S <= unsigned(ss_d(167 downto 152));
+        PBR <= ss_d(133 downto 126);
+        DBR <= ss_d(62 downto 55);
+        Mode_r <= ss_d(112 downto 111);
+        BCD_en_r <= ss_d(30);
+        ALU_Op_r_v <= ss_d(12 downto 8);
+        Write_Data_r_v <= ss_d(174 downto 171);
+        Set_Addr_To_r_v <= ss_d(169 downto 168);
+        WRn_i <= ss_d(175);
+        EF_i <= ss_d(95);
+        MF_i <= ss_d(110);
+        XF_i <= ss_d(176);
+        NMICycle <= ss_d(116);
+        IRQCycle <= ss_d(105);
+        rdy_mod <= ss_d(150);
       end if;
     end if;
   end process;
@@ -520,9 +601,18 @@ begin
       end if;
       -- act immediately on SO pin change
       -- The signal is sampled on the trailing edge of phi1 and must be externally synchronized (from datasheet)
-      SO_n_o <= SO_n;
-      if SO_n_o = '1' and SO_n = '0' then
-        P(Flag_V) <= '1';
+      if SS_Hold = '0' then
+        SO_n_o <= SO_n;
+        if SO_n_o = '1' and SO_n = '0' then
+          P(Flag_V) <= '1';
+        end if;
+      end if;
+      if SS_En = '1' then
+        P <= ss_d(125 downto 118);
+        ABC(7 downto 0) <= ss_d(70 downto 63);
+        X(7 downto 0) <= ss_d(78 downto 71);
+        Y(7 downto 0) <= ss_d(86 downto 79);
+        SO_n_o <= ss_d(170);
       end if;
 
     end if;
@@ -627,6 +717,16 @@ begin
           end if;
         end if;
       end if;
+      if SS_En = '1' then
+        NMI_entered <= ss_d(113);
+        BusA_r <= ss_d(38 downto 31);
+        BusB <= ss_d(46 downto 39);
+        BusB_r <= ss_d(54 downto 47);
+        AD <= ss_d(7 downto 0);
+        BAL <= ss_d(29 downto 21);
+        BAH <= ss_d(20 downto 13);
+        DL <= ss_d(94 downto 87);
+      end if;
     end if;
   end process;
 
@@ -724,6 +824,15 @@ begin
         if NMI_entered='1' then
           NMIAct <= '0';
         end if;
+      end if;
+      if SS_En = '1' then
+        MCycle <= ss_d(109 downto 107);
+        RstCycle <= ss_d(151);
+        NMIAct <= ss_d(115);
+        IRQReq <= ss_d(106);
+        NMIReq <= ss_d(117);
+        IRQ_n_o <= ss_d(104);
+        NMI_n_o <= ss_d(114);
       end if;
     end if;
   end process;

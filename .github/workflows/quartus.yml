@@ -1,0 +1,90 @@
+# WP B4: compile the core with Quartus Prime Lite 17.0.2 on every push of the
+# development branches and publish ALM / M10K / DSP / Fmax. The job fails if
+# the compile fails or timing is not met. The .rbf is kept as an artifact.
+name: Quartus build
+
+on:
+  push:
+    branches: [pause, savestates, 'ss/**']
+    paths-ignore: ['docs/**', 'tools/**', 'lint/**', 'savestate/**', 'sim/**', '**.md']
+  pull_request:
+    branches: [pause, savestates]
+    paths-ignore: ['docs/**', 'tools/**', 'lint/**', 'savestate/**', 'sim/**', '**.md']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Commit/branch to compile (default: the dispatched ref), e.g. 88354ba for the upstream baseline'
+        required: false
+        default: ''
+
+concurrency:
+  group: quartus-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      QUARTUS_IMAGE: theypsilon/quartus-lite-c5:17.0.2.docker0
+    steps:
+      # CI scripts always come from the dispatched ref; the core to compile can
+      # be another commit (baseline numbers for the ALM/Fmax delta).
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+      - uses: actions/checkout@v4
+        with:
+          path: src
+          fetch-depth: 0
+      # actions/checkout only takes full SHAs, branches and tags: resolve the
+      # input with git so short SHAs (e.g. 88354ba) work too.
+      - name: Select ref to compile
+        if: ${{ inputs.ref != '' }}
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          git -C src checkout --detach "$REF" || git -C src checkout --detach "origin/$REF"
+          git -C src log -1 --oneline
+
+      # The image's glibc is too old for the JavaScript actions, so only
+      # Quartus runs inside it; checkout and upload stay on the host.
+      - name: Compile
+        run: |
+          cd src
+          # quartus_sh is not on the image PATH: locate it inside the container.
+          docker run --rm -v "$PWD":/build -v "$GITHUB_WORKSPACE/ci/.github/scripts":/ci:ro -w /build -u "$(id -u):$(id -g)" -e HOME=/tmp \
+            --entrypoint /bin/sh "$QUARTUS_IMAGE" -c '
+              # use the bin/ wrapper (sets LD_LIBRARY_PATH), not linux64/quartus_sh
+              Q=$(command -v quartus_sh || find / -xdev -path "*/quartus/bin/quartus_sh" 2>/dev/null | head -n 1)
+              [ -n "$Q" ] || { echo "quartus_sh not found in image"; exit 127; }
+              echo "using $Q"
+              "$Q" --flow compile C64 || exit $?
+              # failing paths (setup and hold, every corner) for the report
+              "$(dirname "$Q")/quartus_sta" -t /ci/sta_paths.tcl C64 C64 output_files/C64.paths.rpt \
+                || echo "sta_paths.tcl failed (report without paths)"'
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          status=0
+          sh ci/.github/scripts/quartus_report.sh src/output_files C64 > report.md || status=$?
+          echo "Compiled: \`$(git -C src rev-parse --short HEAD)\`" >> report.md
+          cat report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - name: Keep rbf and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: C64-${{ inputs.ref || github.sha }}
+          path: |
+            src/output_files/C64.rbf
+            src/output_files/*.summary
+            src/output_files/*.sta.rpt
+            src/output_files/*.fit.rpt
+            src/output_files/*.paths.rpt
+            report.md
+          if-no-files-found: warn

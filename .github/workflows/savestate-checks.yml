@@ -1,0 +1,55 @@
+# Fast checks of the savestate infrastructure (no FPGA tools needed):
+# - B8: generated map artifacts are in sync with savestate/map.yaml and the
+#   VHDL package / Verilog header compile;
+# - B7: the state inventory tool runs on its self-test.
+# - A2: unit benches of the savestate engine (sim/ss/run_tb.sh, iverilog).
+# - B7 on the whole design: inventory of every flip-flop and memory, report
+#   in the step summary; fails on unclassified storage and when the fields of
+#   a map.yaml segment do not match its arch bits (A1 classified the design).
+name: Savestate checks
+
+on:
+  push:
+    branches: [savestates, 'ss/**']
+  pull_request:
+    branches: [savestates]
+  workflow_dispatch:
+
+jobs:
+  map:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q ghdl iverilog verilator python3-yaml
+      - name: Map artifacts in sync (B8)
+        run: python3 tools/ss/gen_ss_map.py --check
+      - name: VHDL package and Verilog header compile
+        run: |
+          mkdir -p build/ghdl
+          ghdl -a --std=08 --workdir=build/ghdl rtl/savestate/c64_savestates_pkg.vhd
+          printf '`include "rtl/savestate/c64_savestates.vh"\nmodule t; endmodule\n' > build/t.v
+          iverilog -o build/t build/t.v
+      - name: State inventory self-test (B7)
+        run: python3 lint/test_state_inventory.py
+      - name: Savestate engine unit benches (A2)
+        run: sim/ss/run_tb.sh
+
+  inventory:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q ghdl-gcc yosys yosys-plugin-ghdl verilator python3-yaml
+      - name: State inventory of the whole design (B7)
+        run: |
+          rc=0
+          lint/run_inventory.sh --fail-unclassified || rc=$?
+          sed -n '1,/^## Unclassified/p' lint/build/inventory.md >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: state-inventory-${{ github.sha }}
+          path: |
+            lint/build/inventory.md
+            lint/build/inventory.csv
