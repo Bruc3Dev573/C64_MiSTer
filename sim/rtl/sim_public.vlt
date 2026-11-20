@@ -36,6 +36,9 @@ public_flat_rd -module "emu" -var "ss_test_done"
 public_flat_rd -module "emu" -var "ss_test_pass"
 public_flat_rd -module "emu" -var "ss_slot"
 public_flat_rw -module "spram_4_10" -var "ram"
+// REU page map (D13): --reu-fill marks every page written; the power-on fill
+public_flat_rw -module "ss_reu_map" -var "map"
+public_flat_rd -module "emu" -var "ss_reu_clr"
 // savestate WP A3: registers the chain does not carry because they hold a
 // fixed value whenever the engine owns the machine (state_classes.yaml)
 public_flat_rd -module "fpga64_sid_iec" -var "phi0_cpu"

@@ -79,7 +79,7 @@ task pulse_save(input [1:0] s); begin @(posedge clk) begin slot <= s; save <= 1;
 task pulse_load(input [1:0] s); begin @(posedge clk) begin slot <= s; load <= 1; end @(posedge clk) load <= 0; end endtask
 task idle_wait; begin repeat (3) @(posedge clk); while (eng_busy || dut.awaiting || dut.save_buf || dut.load_buf || dut.test_buf || dut.tstep) @(posedge clk); repeat (3) @(posedge clk); end endtask
 
-localparam [28:0] BASE = 29'h07C00000, SW = 29'h100000;
+localparam [28:0] BASE = 29'h05580000, SW = 29'h2A0000;
 localparam [28:0] A1 = BASE + SW, A2 = BASE + 2*SW, A3 = BASE + 3*SW, A4 = BASE - SW;   // scratch slot of the self-test
 reg seen_done; reg seen_pass;
 always @(posedge clk) if (test_done) begin seen_done = 1; seen_pass = test_pass; end

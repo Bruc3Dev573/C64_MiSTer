@@ -24,10 +24,11 @@ SDRAM=real DRIVES=0 RTL_OVERLAY="$B/overlay" BUILD_DIR="$B/negative" \
 	"$SIM/build.sh" > "$B/negative-build.log" 2>&1 || {
 	cat "$B/negative-build.log"; exit 1;
 }
-# A bounded cold boot is enough to exercise thousands of real controller accesses.
+# A bounded cold boot is enough to exercise thousands of real controller accesses
+# once the power-on REU fill (engine-owned, ~14.5 frames) is done: 18 frames.
 # Failure to reach READY is not the negative-control oracle: require a tRCD count.
 set +e
-(cd "$B/negative/run" && ../obj-nodrv-sdram-real/Vemu boot --no-cache --max-frames 1) > "$B/negative.log" 2>&1
+(cd "$B/negative/run" && ../obj-nodrv-sdram-real/Vemu boot --no-cache --max-frames 17) > "$B/negative.log" 2>&1
 rc=$?
 set -e
 grep -E '^SDRAM (violation|summary|count)|^FAIL: SDRAM' "$B/negative.log"

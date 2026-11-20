@@ -13,13 +13,12 @@ This branch adds four savestate slots. It is an unofficial test build, not from 
 | OSD **Save state** / **Restore state**, **Savestate Slot** | The same from the OSD |
 | OSD **Savestate self-test** | Saves and loads a scratch slot and shows PASS or FAIL |
 
-A slot holds the whole machine, also in the middle of a disk or tape load: both drives with their disks, the datassette, cartridges (EasyFlash flash and RAM included), REU 512 KB and 2 MB, GeoRAM, the Sound Expander, both SIDs, the RTC and the mouse.
+A slot holds the whole machine, also in the middle of a disk or tape load: both drives with their disks, the datassette, cartridges (EasyFlash flash and RAM included), the REU up to 16 MB, GeoRAM, the Sound Expander, both SIDs, the RTC and the mouse. Only the REU pages written since power on go into a slot, and a save with a full 16 MB REU takes about half a second.
 
 Slot files on the SD card (`savestates/C64/<file>_1.ss` to `_4.ss`, named after the loaded file or the disk in drive 8) need the modified Main of release [20261010-c64-savestates-r2](https://github.com/Bruc3Dev573/Main_MiSTer/releases/tag/20261010-c64-savestates-r2). With the official Main the slots work but stay in memory until the MiSTer is powered off.
 
 Known limits:
 
-- With the 16 MB REU a save is refused ("REU too large for the slot").
 - Load a state with the same settings it was saved with: REU size, GeoRAM, cartridge type, drive types, SID models, PAL/NTSC, VIC-II and CIA models, Sound Expander and System ROM. Otherwise the load is refused.
 - RS-232 and external IEC devices are real-time links: data that arrives during a save or a load is lost.
 

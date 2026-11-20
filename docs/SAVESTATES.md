@@ -44,8 +44,9 @@ empty or invalid, other core version, other hardware settings, slot damaged
 | `rtl/savestate/statemanager.sv` | Request queue (one pending save and load, slot captured at the request, saves first) + OSD self-test |
 | `rtl/savestate/savestate_ui.sv` | Keyboard, pad, OSD, info messages |
 | `rtl/savestate/ss_freeze.sv` | Second freeze level: boundary wait on idle signals, watchdog |
-| `rtl/savestate/ss_sdram_port.sv` | Paced SDRAM access while frozen (RAM, REU) |
-| `rtl/savestate/ss_ddram_arb.sv` | DDR3 arbiter: drive track cache / engine, slot window guard |
+| `rtl/savestate/ss_sdram_port.sv` | SDRAM transfers of 256 bytes while frozen (RAM, REU pages, GeoRAM, cartridge memories; run by the engine sequencer in `rtl/sdram.v`) and the power-on REU fill (D13) |
+| `rtl/savestate/ss_reu_map.sv` | REU page map: one bit per 4 KiB page written since power on (D13) |
+| `rtl/savestate/ss_ddram_arb.sv` | DDR3 arbiter: drive track cache / engine, drive window guard |
 | `rtl/savestate/ss_chain.sv`, `ss_chain_pkg.vhd` | Chain segment helpers for the chip WPs (SV and VHDL) |
 
 ## Freeze
@@ -91,9 +92,10 @@ point"); the `block` output of `ss_freeze` keeps the idle bits that were low
 
 ## Slot format
 
-`C64;SS3E000000:800000,UART9600:2400;` in CONF_STR (Main reads the token
-only from the second field): four slots of 8 MiB at DDR3 0x3E000000
-(decision D2: GeoRAM and the EasyFlash flash must fit). Slot files on the SD
+`C64;SS2AC00000:1500000,UART9600:2400;` in CONF_STR (Main reads the token
+only from the second field): four slots of 21 MiB at DDR3 0x2AC00000
+(decision D13: the 16 MiB REU with GeoRAM must fit; D2 had 8 MiB at
+0x3E000000). Slot files on the SD
 need Main to map the slots after a file load (`FS1` option). The official
 Main loads every C64 file through `c64_open_file()`, which skips that step,
 so there the slots live in DDR3 only: they survive a core reload, not a power
@@ -107,7 +109,7 @@ All words are 64-bit little endian.
 | Word | Content |
 | --- | --- |
 | 0 | `{STATESIZE[31:0], change counter[31:0]}`: STATESIZE = 32-bit words of the whole image **including** this header (Main copies at least that much; it is cleared by the first write of a save and written last, so a torn save leaves a slot that the load refuses) |
-| 1 | `{build hash[31:0], live chain bits[15:0], format version[15:0]}` |
+| 1 | `{build hash[31:0], live chain bits[15:0], format version[15:0]}`; format version 2 (D13), a load also takes version 1 |
 | 2 | `{config mask[31:0], CRC-32[31:0]}`; CRC-32 (IEEE, as zlib) of the bytes from word 3 to the end marker, computed in fabric while streaming |
 | 3.. | TLV regions: header `{length in bytes[31:0], 24'd0, tag[7:0]}`, then ceil(length/8) data words (byte k of the region = byte k%8 of word k/8) |
 | last | end marker, tag 0 length 0 |
@@ -120,7 +122,11 @@ present in this build and configuration. The region table (tags, sizes,
 every region of it: RAM (0x01, 64 KiB), COLORRAM (0x02, 1 KiB, low nibble),
 the regions of both 1541 units (RAM_DRV8/9, EXTRAM_DRV8/9, TRACK_DRV8/9,
 always), of both 1581 units (RAM_1581_8/9, FDC_BUF_8/9, always) and the
-optional ones (REU_RAM, GeoRAM, CART_RAM, CART_FLASH, OPL3_REGS) when present.
+optional ones (the REU, GeoRAM, CART_RAM, CART_FLASH, OPL3_REGS) when present.
+The REU is saved as REU_PAGES (tag 0x15, D13): for each 4 KiB page written
+since power on (`ss_reu_map`), a record word `{4096, page index}` and the 512
+words of the page, page indexes strictly increasing; a format 1 slot holds
+the whole REU under REU_RAM (tag 0x09) and still loads.
 The EasyFlash RAM is no region of its own: it is in SDRAM, inside CART_RAM
 (A11; the A1 placeholders EZ_RAM, OPL3_RAM and OPL3_FIFO are gone, D9).
 
@@ -134,10 +140,13 @@ zeros into it. Since A10 the live chain is 10445 bits (A11 adds none; table in
 "Scan chain").
 
 A **load** reads words 0-2 (size, format version, chain length, config mask),
-then reads the whole payload once to check the TLV structure, the CRC and
-that every region present in this configuration is in the slot. Only then
-does it write anything: chain, then regions. Unknown tags are skipped, as are
-known regions not present here. A refused load leaves the machine as it was.
+then reads the whole payload once to check the TLV structure, the REU page
+records (order, index, length), the CRC and that every region present in
+this configuration is in the slot. Only then does it write anything: chain,
+then regions; the REU pages the slot holds are written and every page the
+machine has written since power on that the slot does not hold is zeroed,
+so the REU is exactly the one saved. Unknown tags are skipped, as are known
+regions not present here. A refused load leaves the machine as it was.
 
 Config mask bits (map.yaml): REU size, GeoRAM, drive type of units 8 and 9
 (1 = 1581, from the mounted image; A8), SID models, NTSC, VIC-II variant,
@@ -154,22 +163,26 @@ written, so Main does not copy the slot).
 
 | Region | Port | Speed |
 | --- | --- | --- |
-| RAM 64 KiB | SDRAM at 0x0000000 through `ss_sdram_port`: takes the SDRAM mux of `c64.sv` while frozen and issues one access on a free slot of the normal C64 cycle grid (never the refresh slot), same 8-clk64 spacing as a turbo CPU | 4 bytes per 32 clk_sys: ~17 ms |
+| RAM 64 KiB | SDRAM at 0x0000000 through `ss_sdram_port` (D13): while frozen the port owns the SDRAM (`c64.sv` masks the machine's ce) and `sdram.v` runs transfers of 256 bytes of one row and DQ lane (two AUTO REFRESH, ACTIVE, 256 columns, the last with auto-precharge; WRITE on every clk64, READ on every other one), 267 clk_sys per read transfer, 140 per write transfer | ~2.2 ms |
 | Color RAM 1 KiB | borrows the port of the `spram` in `fpga64_sid_iec` (address/data/we mux, active only with `sysEnable` low) | 3 clocks per byte |
-| REU 512 KiB / 2 MiB | SDRAM at 0x1000000, when the REU is enabled | ~130 ms / ~0.5 s |
-| GeoRAM 4 MiB | SDRAM at 0x0C00000 (`{3'b011, geo_bank}`, the page register on the CART segment), when GeoRAM is enabled and no CRT is attached | ~1.1 s |
-| CART_RAM 64 KiB | SDRAM at 0x0010000 (cartridge RAM banks, `get_bank`), with a CRT attached; holds the EasyFlash RAM ($DF00-$DFFF: bank 0, 0x0011F00) | ~17 ms |
-| CART_FLASH 1 MiB | SDRAM at 0x0200000 (EasyFlash flash, `ezmem_addr`; programs erase/program it), with an EasyFlash CRT | ~270 ms |
+| REU 512 KiB / 2 MiB / 16 MiB | SDRAM at 0x1000000 (DQ lane 1), when the REU is enabled: only the 4 KiB pages written since power on (REU_PAGES), 16 transfers per page | save 136 us per page, load 92 us (verify pass included); all 4096 pages (16 MiB): save 0.566 s, load 0.384 s |
+| GeoRAM 4 MiB | SDRAM at 0x0C00000 (`{3'b011, geo_bank}`, the page register on the CART segment), when GeoRAM is enabled and no CRT is attached | ~139 ms |
+| CART_RAM 64 KiB | SDRAM at 0x0010000 (cartridge RAM banks, `get_bank`), with a CRT attached; holds the EasyFlash RAM ($DF00-$DFFF: bank 0, 0x0011F00) | ~2.2 ms |
+| CART_FLASH 1 MiB | SDRAM at 0x0200000 (EasyFlash flash, `ezmem_addr`; programs erase/program it), with an EasyFlash CRT | ~35 ms |
 | RAM_DRV8/9 2 KiB, EXTRAM_DRV8/9 8 KiB, TRACK_DRV8/9 8 KiB | port a of the block RAMs of each 1541 unit (`c1541_logic` RAM and RAM expansion, `c1541_direct_gcr` track buffer by byte lane), muxed while the engine owns the machine; always present | 3 clocks per byte, ~6 ms for the six |
 | RAM_1581_8/9 8 KiB, FDC_BUF_8/9 1 KiB | the RAM of each 1581 unit through its CPU ports (written on port a, read on port b on the clock of the request, so it stays one simple dual-port RAM) and the WD1772 sector buffer of `fdc1772` on its SD-side port a, muxed while the engine owns the machine; always present | 3 clocks per byte, ~3 ms for the four |
 | OPL3_REGS 256 bytes | register shadow of `opl3.sv` (its write port is shared with the C64 writes, its read port with the replay), with the Sound Expander on | 2 clocks per byte |
 
-Times are for the save; a load reads the slot twice (verify, then restore)
-and writes the SDRAM at the same pace. The other CRT types keep their ROM
-in SDRAM as loaded from the file: not saved, the config mask holds the CRT
-hardware type so a slot of another cartridge type is refused (the same type
-with another file is not detected). Whole regions are saved, no dirty
-bitmap: everything fits the 8 MiB slot except a 16 MiB REU.
+Times are for the save (the SDRAM regions at 35 ms per MiB, from the 267
+clk_sys per read transfer of `tb_ss_transport`); a load reads the slot twice
+from DDR3 (verify, then restore) and writes the SDRAM at 18 ms per MiB (140
+clk_sys per write transfer). The SDRAM READs are one every other clk64: one
+per clk64 passes every checker of the simulation but saved corrupted bytes
+on the board (`sdram.v`, sim/README.md "Known limitations"). The other CRT types keep
+their ROM in SDRAM as loaded from the file: not saved, the config mask holds
+the CRT hardware type so a slot of another cartridge type is refused (the
+same type with another file is not detected). Whole regions are saved except
+the REU (written pages only): every configuration fits the 21 MiB slot.
 
 After a load `ss_load_done` also pulses the keyboard reset of fpga64
 (decision D3): every key is released, so no key stays stuck from the moment
@@ -177,8 +190,9 @@ of the save or of the load. Joystick and paddle lines are live host inputs
 (nothing latched). The C64-side state (CIA ports, keyboard scan) stays as
 saved once those segments are on the chain.
 
-No new block RAM: the engine streams 64-bit words between the regions and
-DDR3 with one word buffer.
+The engine streams 64-bit words between the regions and DDR3 through a
+64-word FIFO (MLAB), DDR3 in bursts of 32 words, CRC-32 over 8 bytes per
+clock; the REU page map is one M10K.
 
 ### 1541: track buffer and disk image (A8)
 
@@ -331,43 +345,66 @@ count, data, read stage, `ss_mem_req`) and the arbiter of the two chips.
   nothing, the file gets the flash with the next write-back and save.
 
 GeoRAM (4 MiB, OSD option, no CRT attached; cartridge type 99): the RAM is
-region GEORAM (SDRAM 0x0C00000, ~1.1 s per save), the block and page
+region GEORAM (SDRAM 0x0C00000, ~71 ms per save), the block and page
 registers ($DFFF, $DFFE) are `geo_bank` on the CART segment. The window
 $DE00-$DEFF is a plain SDRAM access of the C64 cycle: nothing is pending at a
 boundary.
 
 ### Slot size and the REU
 
-An 8 MiB slot holds the C64 state with a 512 KiB or 2 MiB REU together with
-GeoRAM 4 MiB and the EasyFlash flash. With the 16 MiB REU a save is refused
-before the slot is touched ("REU too large for the slot"); a load of a slot
-made with another REU size is refused by the config mask. A 16 MiB REU needs
-slots of about 17 MiB, i.e. a lower base (for example `SS3A000000:1100000`,
-68 MiB from 0x3A000000, checked against the drive cache map below) and a
-Main that accepts that size; left for WP A7 (REU state) to decide.
+Decision D13. A 21 MiB slot holds the largest configuration, REU 16 MiB +
+GeoRAM 4 MiB + the rest: 2,641,076 words (20.15 MiB) with every REU page
+written. The REU is saved page by page: `ss_reu_map` (4096 bits) marks every
+4 KiB page of the REU lane (SDRAM 0x1000000-0x1FFFFFF) that the machine
+writes (REU DMA, REU file load: every write of the SDRAM mux with address
+bit 24 while the engine does not own it); the bits stay across core resets,
+as the REU data does. A save scans the map and writes one REU_PAGES record
+per marked page. A load restores the pages of the slot (and marks them) and
+zeroes every marked page the slot does not hold (and clears its bit): the
+REU content is exactly the saved one, because an unmarked page is zero.
+
+That holds because the REU lane is zero at power on: after FPGA
+configuration `c64.sv` holds the machine in reset (`ss_reu_clr`, ioctl waits;
+its cycle grid and video run, its SDRAM ce is masked) while `ss_sdram_port`
+zero-fills the 16 MiB lane with 65,536 transfers (~9.1M clk_sys, 0.29 s added
+to the first boot), then hands the SDRAM back on a refresh pulse, where the
+machine's ce is low: no access starts mid-cycle and the video never stops
+(`pausetest --sync-check`). A first version paused the machine for the fill
+instead: its release, the first resume after power on, moved the output
+sync by 2 dots once (one line of 506 dots). Before D13 the REU
+held whatever the SDRAM powered up with.
+
+A slot made with another REU size is refused by the config mask. A format 1
+slot (8 MiB era, whole REU under REU_RAM) loads: every page counts as
+written. The largest state fits a 21 MiB slot, so RES_TOOBIG ("REU too
+large for the slot") stays only as a guard of the engine.
 
 ## DDR3
 
 | Byte address | Use |
 | --- | --- |
+| 0x29700000 - 0x2ABFFFFF | self-test scratch slot (not declared to Main, never copied to SD; D13) |
+| 0x2AC00000 - 0x2FFFFFFF | savestate slots 1-4, 21 MiB each (D13) |
 | 0x30000000 + G64 offset | drive 8 image (1541 track cache, `c1541_track`, word base 0x06000000) |
 | 0x30200000 + G64 offset | drive 9 image (word base 0x06040000) |
-| 0x3D800000 - 0x3DFFFFFF | self-test scratch slot (not declared to Main, never copied to SD) |
-| 0x3E000000 - 0x3FFFFFFF | savestate slots 1-4, 8 MiB each |
 
-The drive addresses are `base + G64 track offset / 8`; the offsets come from
-the G64 header written by Main (an image of a few hundred KiB), so they stay
-below 0x30400000 and never reach 0x3D800000 (it would take an offset of
-216 MiB). A corrupt G64 header could still point anywhere: `ss_ddram_arb`
-drops drive writes into 0x3D800000-0x3FFFFFFF (accepted, not written). The
-1581 does not use DDR3.
+Below 0x29700000: the ascal triple buffer (0x20000000-0x217FFFFF), the Main
+frame buffer (0x22000000-0x237BAFFF) and the screenshot buffer (0x20000000 +
+6 MiB); Linux ends at 0x1FEFFFFF (D13). The drive addresses are `base + G64
+track offset / 8`; the offsets come from the G64 header written by Main (an
+image of a few hundred KiB), so they stay below 0x30400000. A corrupt G64
+header could still point anywhere: `ss_ddram_arb` accepts drive writes only
+inside 0x30000000-0x30FFFFFF and drops the others (accepted, not written),
+so neither the slots nor the scratch slot can be hit. The 1581
+does not use DDR3.
 
-`ss_ddram_arb`: the drives own the port by default. During a save or load
-the arbiter takes it as soon as the drive side has no request and no read
-beat outstanding; the drive DMA then sees DDRAM_BUSY and waits. The engine
-does single 64-bit accesses (burst 1). The drive debug overlay snoops only the
-drive's own read data. The track cache issues no new DDR3 request while the
-machine is stopped (A8); read beats already requested are taken.
+`ss_ddram_arb`: two Avalon masters, the drives and the engine, arbitrated
+burst by burst. The owner changes only when it has no burst in progress and
+no read beat outstanding; the waiting side sees DDRAM_BUSY. The engine
+writes and reads bursts of 32 words (D13), so a drive request waits at most
+one engine burst. The drive debug overlay snoops only the drive's own read
+data. The track cache issues no new DDR3 request while the machine is
+stopped (A8); read beats already requested are taken.
 
 ## Scan chain (for the chip WPs)
 
@@ -571,20 +608,22 @@ output by the paused time.
 
 | Command | What |
 | --- | --- |
-| `sim/ss/run_tb.sh` | `tb_savestates` (engine + arbiter + freeze controller + DDR3 model with random waitrequest and garbage readdata + drive traffic + 75-bit test chain of three segments), `tb_savestates_dead` (same, one segment not live), `tb_statemanager`, `tb_ssui`, GHDL analysis of `ss_chain_pkg.vhd`; also in CI (savestate-checks) |
+| `sim/ss/run_tb.sh` | `tb_savestates` (engine + arbiter + freeze controller + DDR3 model with random waitrequest, garbage readdata and burst reads + drive traffic during the operations + 75-bit test chain of three segments; D13: SDRAM transfer port model taking the first word with the request, REU pages saved as records and restored, unmapped pages zeroed, a damaged record order with a valid CRC refused, a format 1 slot with the whole REU loaded, DDR3 bursts of 32 and every drive beat delivered), `tb_savestates_dead` (same, one segment not live), `tb_statemanager`, `tb_ssui`, `tb_ss_transport` (D13, Verilator: `rtl/sdram.v` + checked chip model + `ss_sdram_port`: the power-on fill requested during the controller's init, normal accesses before, during (masked) and after ownership, write/zero/read transfers on random rows of both lanes and all banks, the other lane untouched, 0 violations in both owner buckets), `tb_ascal_vcpt` (D13, GHDL: the local change of `sys/ascal.vhd` against upstream, "Resources"), GHDL analysis of `ss_chain_pkg.vhd`; also in CI (savestate-checks) |
 | `sim/tests/savestate.sh` | whole core (Verilator, DDR3 modelled): save at READY, change screen and Color RAM with a PRG, load: RAM and Color RAM restored exactly, screenshot equal; OSD self-test |
 | `SDRAM=real DRIVES=0 sim/build.sh` | Build real `rtl/sdram.v` driving a command-level MT48LC16M16A2, then run each of `savestate.sh`, `pause.sh` and `ssdiff.sh` with `SDRAM=real`. Checks byte lanes, bank/row state, CAS=2, auto-precharge, initialization, tRCD/tRP/tRAS/tRC/tRFC/tWR/tMRD and rolling 8192-refresh/64 ms retention. Each instance reports violations and longest refresh gap separately while `ss_sd_own` is asserted and during normal running; a violation fails the run. Use the same option for the long `LORENZ`/`VICII` run. Timing sources and model limits: `sim/README.md`, “Real SDRAM controller and chip checking”. |
-| `sim/tests/sdram.sh` | Chip self-check: all banks, both byte lanes, DQM on writes and reads, CAS=2, auto-precharge, intentional tRCD and refresh-deadline violations with engine ownership. Then a throwaway `RTL_OVERLAY` build with `RASCAS_DELAY=1`: requires actual tRCD violations, not just a failed boot. On 2026-11-06: chip checks PASS; overlay rejected with 143,603 normal-running tRCD violations, zero engine-owned violations. |
+| `sim/tests/sdram.sh` | Chip self-check: all banks, both byte lanes, DQM on writes and reads, CAS=2, auto-precharge, intentional tRCD and refresh-deadline violations with engine ownership. Then a throwaway `RTL_OVERLAY` build with `RASCAS_DELAY=1`: requires actual tRCD violations, not just a failed boot (18 frames: the power-on REU fill comes first). On 2026-11-06: chip checks PASS; overlay rejected with 143,603 normal-running tRCD violations, zero engine-owned violations. On 2026-11-15 (D13, final RTL): chip checks PASS; overlay rejected with 328,119 normal tRCD violations, the engine-owned power-on fill 0 violations (9,118,336 clk_sys, 133,923 refreshes, longest gap 456 clk64). |
 | `sim/tests/ssdiff.sh` | Field offsets from slots saved at a known point (`ss_slot.py --fields`): CPU PC/A/X/Y, CIA1 and VIC after the KERNAL init (regs.prg), SID1/SID2 register files (sid.prg), REU registers after a swap (reu.prg), CART bank registers (ocean.crt). B3 differential `ssdiff` at READY, in sid.prg (noise/pulse/triangle, gate toggles, filter sweep, OSC3/ENV3 read back), reu.prg (REU 512 KiB: swap and $FF00-triggered fetch in a loop, REU RAM in the slot), ocean.crt (Ocean bank switching from the cartridge ROM) and, with `LORENZ=<dir of Disk1-3.d64>` / `VICII=<dir of VICE VICII testprogs>`, inside 29 Lorenz 2.15 tests (CPU, CIA timers/TOD/ICR/serial) and 9 VIC-II tests: B saves slot 2, runs on, saves slot 1, loads slot 2, loads slot 1, saves slot 3 (= slot 1 byte for byte), resumes, and must stay sample-identical (bus, RAM strobes, RGB, audio mix) to the uninterrupted A; the 'rebuilt' grid registers and the T65 reset synchroniser are checked on every clock the engine owns B. `JOBS=n` runs tests in parallel. Test programs: `sim/scripts/testprgs.sh`; `--prg x.crt` loads a CRT through the OSD index |
 | `sim/tests/pause.sh` | A0 pause (no savestate), the OSD pause: B paused, A not, sample-identical after the resume and regular video sync; READY, NTSC, tape LOAD on a pilot tone and on varied pulses with a 10-frame pause (`tapevar`), sid.prg, reu.prg, ocean.crt, ef.crt (the pause inside a sector erase, A11), geo.prg (A11), rtc.prg, opl.prg (`--opl`: the OPL output is in the compared audio, A9) |
 | `sim/tests/ssdiff.sh` opl.prg, oplrewind (A9) | `--opl`, Sound Expander on (status 12, DolphinDOS): the OPL3 fields at the first wait of opl.prg (index $A0 before its value, timer presets and enables) and the OPL3_REGS region; ssdiff inside the music (timers polled by the CPU, index written before each wait), audio compared up to the first load, the rest of the sample exact. After the resume, with a model of the queue the Z80 reads: B's queue consumed within one frame (21,234 clk_sys), at that point the registers and the index latch the firmware took equal B's shadow and index register, and at the end the register files of A and B are equal. `oplrewind` (`--rewind`, audio left out): the FM part holds the registers of C1 when the state of C0 is loaded, so the replay has to queue the changed ones. Negative controls (overlay of `opl3.sv`): without the final index the latch check fails; without the replay `oplrewind` fails |
 | `sim/tests/ssdiff.sh` tape scenarios | `pilot` (pilot tone), `vartap` (20000 pulses of varied length: a byte lost, repeated or corrupted anywhere in the tape path changes the cassette line, a pilot tone hides it) and `rewind` (`--rewind`: B saves slot 2 at C0, runs on, loads it and must replay A's samples from C0, i.e. a load of a state from another moment) |
 | `sim/tests/ssdiff.sh` ef.crt, geo.prg (A11) | `ef`: EasyFlash CRT (`testprgs.sh`) that boots in Ultimax and loops from RAM: sector erase of ROML banks 0-7 with DQ6 polling (the poll count goes to the screen), 64 bytes programmed in bank 1 from the pass number and the EasyFlash RAM, read back and summed into the EasyFlash RAM; both save points and loads fall inside a sector erase (`CART.ez_rom_rom0_state` busy and `ez_rom_rom0_mem_req` set in both slots), so the busy counter, the partly done write-back and the partly erased flash come back. `geo`: GeoRAM 4 MiB on (status 52 at READY), pages written through $DFFE/$DFFF and $DE00 and read back one and eight passes later on both sides of the save points; the GEORAM region in both slots. The harness lets A run at most 1M samples ahead of B's comparisons, so the seconds a GeoRAM save takes queue no samples |
+| `sim/tests/ssdiff.sh` reu16, reu16full, reu2m, crc16 (D13) | REU on at READY (`--status-ready 53,54`, 16 MiB; `54`, 2 MiB). `reu16`: reu.prg, the slots hold REU_PAGES with the few pages written. `reu16full`: `--reu-fill` (every page of the 16 MiB lane written and mapped): the worst-case save and two loads of 16 MiB inside the differential; both slots hold 4096 records. `crc16`: a damaged full 16 MiB slot refused after the verify pass, the machine untouched. 2026-11-15, default SDRAM model: all PASS (`reu16full` 3,949,258 running samples identical, slots of 4,233,508 words; `reu16` and `reu2m` 4,735,306; `crc16` refused with result 6, CRC/structure, chain and RAM unchanged) |
+| `run_core.sh pausetest --no-cache --sync-check` | D13: the core output from power on to READY, across the power-on REU fill (machine in reset) and the hand-back of the SDRAM, keeps a regular h/v sync after the start-up frame (every irregular line and frame is listed, with the sample where the fill ended) and the picture changes; then the usual user pause differential. 2026-11-15: PASS, fill done at sample 2,279,532, the only irregular periods are those of the start-up frame (hsync 506 at sample 157,259, 417 at 157,676, vsync 308,867 at 463,604), identical in the A12 model with the same check; user pause PASS, video PASS |
 | `run_core.sh pausetest --load-slot board.ss` | A/B pause test from a slot saved on the board (sim built with `BUILD_DATE=yymmdd` of the board build, same chain) |
 | `DRIVE=1 sim/tests/ssdiff.sh` | adds the drive differentials on the full model, run at once: 1541, DolphinDOS parallel-cable `LOAD"*",8` of a 7-block file from a D64 made by `mkd64.py`, both save points (C0, C1) and the load while the head reads track 17 (`DRV8_1541.track` checked in both slots), drive RAM, RAM expansion and track buffer in the slot; 1581 (A10), DolphinDOS `LOAD"*",8` of a 3-block file from a D81 made by `mkd81.py`, both save points while the WD1772 reads the 10 sectors of the directory track (`DRV8_1581.fdc_track` 0x27 and `fdc_motor_on` checked in both slots), drive RAM and sector buffer in the slot; `drive1581rw` (`--rewind`): the load of a state saved while the WD1772 hands the bytes of a sector to the CPU (checked in its slot: transfer running) |
 | `DRIVE=1 sim/tests/pause.sh` | adds the OSD pause during the same DolphinDOS disk LOADs (1541 and 1581, full model) |
 | `sim/run_core.sh boot --prg f.prg --freeze-at <cycles or $ADDR> --slot out.ss` | write a slot image; `--load-slot in.ss` restores one |
-| `sim/scripts/ss_slot.py slot.ss` | header, TLV list, CRC check with zlib, `--region TAG file` extracts a region, `--fields SEG` decodes a chain segment |
+| `sim/scripts/ss_slot.py slot.ss` | header, TLV list, CRC check with zlib, REU_PAGES record check (format 2), `--region TAG file` extracts a region, `--reu file` writes the REU as a 16 MiB image (format 1 or 2, absent pages zero), `--fields SEG` decodes a chain segment |
 
 The DRIVES=0 quick suite also exercises NTSC 6567R8 at power on (SID and a
 decimal ADC/SBC CPU loop), C128 turbo at 2x/4x and Smart
@@ -675,7 +714,22 @@ clk48 +2.668 / +0.261 ns. A12 (rewind ring in the request manager, engine
 input `ring`, UI; chain, slot format and M10K unchanged): 34,846 ALMs (83 %,
 +95), 39,336 registers, M10K 503 / 553, worst setup slack +0.617 ns (HDMI
 clock), worst hold +0.245 ns; clk_sys +2.114 / +0.256 ns, clk64 +1.812 /
-+0.245 ns, clk48 +2.611 / +0.253 ns.
++0.245 ns, clk48 +2.611 / +0.253 ns. D13 (block transport with READs every
+other clk64, REU page map, 21 MiB slots, power-on fill under reset;
+`C64_A12r.rbf`, md5 `237c89151a787440e45d2adbb2a46e11`): 35,725 ALMs (85 %,
++744 over A12v's 34,981), 40,088 registers, M10K 504 / 553 (+1: the REU page
+map; the engine FIFO is an MLAB), worst setup slack +0.195 ns (HDMI clock),
+worst hold +0.173 ns (HDMI clock); clk_sys +2.863 / +0.254 ns, clk64 +1.433 /
++0.252 ns, clk48 +2.969 / +0.417 ns. The `sdram.v` I/O registers stay packed into the
+I/O cells as in A12: the same 68 register/pin pairs (16 DQ input, 16 DQ
+output enable, 36 output registers). D13 with the load sync fix of
+`savestates` (merge of `9a607eb`: `vic_x`/`vic_y` taps into `video_sync`,
+`ss_freeze` `run_ok`; `C64_A12rs.rbf`, md5
+`4a677c9291015139bc00c6b59692dbd8`, clean database): 35,801 ALMs (85 %, +76),
+39,963 registers, M10K 504 / 553, DSP 60, worst setup slack +0.127 ns (HDMI
+clock), worst hold +0.241 ns (clk64); HDMI +0.127 / +0.259 ns, clk_sys
++1.629 / +0.263 ns, clk64 +1.167 / +0.241 ns, clk48 +2.516 / +0.252 ns; the
+same 68 I/O register/pin pairs.
 
 **Local change of the framework (A11).** `sys/ascal.vhd` (the MiSTer scaler,
 identical to Template_MiSTer master, which has no newer version of it) is
@@ -690,9 +744,56 @@ compile missed the HDMI clock by 0.075 ns on that path (`o_vacpt[9]` ->
 A10 (+0.505 ns): the margin of the scaler moves with the placement of the
 core. A framework update has to keep or redo this change.
 
+**Local change of the framework (D13).** The first D13 fit missed the HDMI
+clock by 0.205 ns (28 paths, all `o_vcpt_pre3` -> `o_vcpt_pre3`: the line
+counter of the output sweep `OSWEEP`, through the adder of `o_vcpt_pre3+1`
+and its compare with the frame length `o_vtotal` into the synchronous clear
+of the counter; 3 logic levels, data 6.214 ns, clock skew -0.523 ns), with
+the core clocks at +1.5 ns or more. Template_MiSTer master (last change of
+`sys/ascal.vhd`: `baaeff6` "ascal: reset o_state at vsync", 2026-08-22) is
+identical to this file apart from the A11 change and has the same compare
+(its line 2788). Second change, the same kind as the A11 one: the compare is
+registered one clock before its use (`o_vcpt_pre3_end`). `o_vcpt_pre3`
+changes only on a line-end clock (line ends are at least two clocks apart
+for `o_htotal` >= 2, every real mode), so the register holds the compare of
+the current line on every line-end clock; `o_vtotal` is the mode setting,
+sampled without synchronization (`-- <ASYNC> ?`), so the change is the same
+as a mode change that reaches ascal one clock later. `OSWEEP` has no reset:
+the counter starts at 0 and the register at false, the compare of 0 for any
+`o_vtotal` >= 2. `sim/ss/tb_ascal_vcpt.vhd` (GHDL, in `run_tb.sh`) checks
+it on 4M clocks: the changed counter equals upstream fed with `o_vtotal` one
+clock late on every clock (9,422 changes of `o_vtotal`, 615 on a line-end
+clock, 31,746 frame wraps, VRR jumps, `o_htotal` changes) and equals
+upstream on every clock while no change falls on a line-end clock; a
+mutated copy (compare two clocks late) fails. After the change the HDMI
+clock had +0.593 ns, and +0.195 ns in the final D13 fit (the later
+`sdram.v` and fill changes moved the placement; the worst HDMI paths are the
+polyphase filter paths of the scaler now). A framework update has to keep or redo both changes.
+
 Measured in simulation (sstest): RAM + Color RAM save 19 ms, load 26 ms;
 with the drive regions (A8) save ~810k clk_sys (26 ms), load ~1.14M clk_sys
 (36 ms), with the 1581 regions too (A10, `savestate.sh --full`) save 913k
 clk_sys (29.0 ms), load 1.30M clk_sys (41.3 ms); with GeoRAM 4 MiB + REU
 512 KiB save 1.37 s, load 1.84 s (slot 4.57 MiB). The chain muxes come on
 top with the chip WPs (one 2:1 mux per flip-flop).
+
+D13 (block transport, `savestate.sh` DRIVES=0, both SDRAM models,
+2026-11-15): save 258,051 clk_sys (8.2 ms), load 251,956 clk_sys (8.0 ms),
+against 802k / 1.195M before (slot 124,040 bytes, mostly the drive regions
+on their byte paths); the OSD self-test 1,025,420 clk_sys; the real
+controller with 0 violations (engine-owned: 174,296 refreshes, longest gap
+540 clk64). The first build, one READ per clk64, saved in 224,869 clk_sys.
+
+D13 differentials (`ssdiff.sh`, default SDRAM model, 2026-11-15), save /
+load in clk_sys: REU 16 MiB with every page written (`reu16full`, 4096
+records) 17,842,227 (0.566 s) / 12,106,387 (0.384 s); REU 16 MiB with 8
+pages written (`reu16`) 507,592 / 287,255; GeoRAM 4 MiB (`geo`) 4,649,221
+(0.147 s) / 3,211,485 (0.102 s), against a 38.6M (1.22 s) save before;
+EasyFlash (`ef`) 1,424,181 / 1,037,751, against 10.83M / 14.76M before; a
+damaged 16 MiB slot is refused after the verify pass in 2,610,938 (83 ms).
+The 16 MiB save misses the 0.4 s aimed at: one READ every other clk64 (the
+board-safe cadence) moves one REU byte per two clk64, a floor of 16.78M
+clk_sys (0.532 s). Format 1 slots saved by the A12 model (REU 512 KiB,
+REU 2 MiB, sid.prg) load (621,714 / 1,732,038 / 251,669) and save again
+as format 2 with the same RAM and REU image (128 / 512 pages; sid.prg
+without a REU).

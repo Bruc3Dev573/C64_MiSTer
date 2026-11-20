@@ -77,7 +77,7 @@ V_SRC=(
 	rtl/iec_drive/c1581_multi.sv rtl/iec_drive/c1581_drv.sv rtl/iec_drive/fdc1772.v rtl/iec_drive/floppy.v
 	rtl/iec_drive/iecdrv_mos8520.v rtl/iec_drive/iecdrv_misc.sv rtl/iec_drive/lfsr.v
 	rtl/savestate/savestates.sv rtl/savestate/statemanager.sv rtl/savestate/savestate_ui.sv
-	rtl/savestate/ss_freeze.sv rtl/savestate/ss_sdram_port.sv rtl/savestate/ss_ddram_arb.sv
+	rtl/savestate/ss_freeze.sv rtl/savestate/ss_sdram_port.sv rtl/savestate/ss_ddram_arb.sv rtl/savestate/ss_reu_map.sv
 	rtl/savestate/ss_chain.sv
 	sys/video_freezer.sv
 )
@@ -97,27 +97,14 @@ sed -i 's/(\* *ram_init_file *= *INITFILE *\*) *\(reg \[DATAWIDTH-1:0\] ram\[1<<
 # same result as non-blocking there, Verilator rejects the mix (BLKANDNBLK)
 sed -i 's/\bbank_no = 0;/bank_no <= 0;/' "$B/v/cartridge.v"
 if [ "$SDRAM" = real ]; then
-	python3 - "$B/v/c64.sv" "$B/v/sdram.v" <<'PY'
-import pathlib, re, sys
+	python3 - "$B/v/c64.sv" <<'PY'
+import pathlib, sys
 p = pathlib.Path(sys.argv[1])
 s = p.read_text()
 assert s.count("sdram sdram") == 1, "SDRAM instance not found"
 p.write_text(s.replace("sdram sdram", '`include "sim_sdram_chip.vh"\nsdram sdram'))
-# Verilator 5.020 cannot lower a procedural assignment of Z. Separate its
-# registered value/enable; the real controller's state machine stays intact.
-p = pathlib.Path(sys.argv[2])
-s = p.read_text()
-s, n = re.subn(r'inout\s+reg(\s+\[15:0\]\s+sd_data)', r'inout wire\1', s)
-assert n == 1, "SDRAM DQ declaration changed"
-for old, new in (
-    ("reg bt;", "reg [15:0] sim_dq_out;\nreg sim_dq_oe;\nassign sd_data = sim_dq_oe ? sim_dq_out : 16'bz;\nreg bt;"),
-    ("sd_data <= 16'bZ;", "sim_dq_oe <= 0;"),
-    ("if(wr) sd_data <= {wrdata, wrdata};", "if(wr) begin sim_dq_out <= {wrdata, wrdata}; sim_dq_oe <= 1; end"),
-):
-    assert s.count(old) == 1, "SDRAM DQ assignment changed: " + old
-    s = s.replace(old, new)
-p.write_text(s)
 PY
+	python3 "$SIM/scripts/sdram_dq.py" "$B/v/sdram.v" "$B/v/sdram.v"
 fi
 
 # ---------------------------------------------------------------- 3. ROMs

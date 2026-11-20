@@ -100,9 +100,10 @@ def validate(m):
     for r in m['regions']:
         if not IDENT.match(r['name']):
             raise MapError('region name %r is not an identifier' % r['name'])
-        if r['tag'] in tags or not 0 < r['tag'] < 256:
-            raise MapError('region %s: bad or duplicate tag %#x' % (r['name'], r['tag']))
-        tags.add(r['tag'])
+        for t in [r['tag']] + ([r['pages_tag']] if 'pages_tag' in r else []):
+            if t in tags or not 0 < t < 256:
+                raise MapError('region %s: bad or duplicate tag %#x' % (r['name'], t))
+            tags.add(t)
 
     off = 0
     for c in m['config_mask']:
@@ -122,6 +123,8 @@ def gen_vhd(m):
          '\tconstant SS_WORD_BITS      : natural := %d;' % fmt['word_bits'],
          '\tconstant SS_SLOTS          : natural := %d;' % fmt['slots'],
          '\tconstant SS_SLOT_BYTES     : natural := 16#%X#;' % fmt['slot_bytes'],
+         '\tconstant SS_DDR_BASE       : natural := 16#%X#;' % fmt['ddr_base'],
+         '\tconstant SS_REU_PAGE_BYTES : natural := %d;' % fmt['reu_page_bytes'],
          '\tconstant SS_CHAIN_BITS     : natural := %d;' % m['chain_bits'], '',
          '\t-- scan-chain segments: legacy word address, words reserved,',
          '\t-- chain bits and offset of the first bit in the chain']
@@ -154,6 +157,8 @@ def gen_vhd(m):
     for r in m['regions']:
         L += ['\tconstant SS_TAG_%s : natural := 16#%02X#;' % (r['name'], r['tag']),
               '\tconstant SS_%s_BYTES : natural := %d;' % (r['name'], r['bytes'])]
+        if 'pages_tag' in r:
+            L.append('\tconstant SS_TAG_%s_PAGES : natural := 16#%02X#;' % (r['name'].split('_')[0], r['pages_tag']))
     L += ['', '\t-- config mask bit offsets']
     for c in m['config_mask']:
         L.append('\tconstant SS_CFG_%s : natural := %d; -- %d bit%s' % (
@@ -170,6 +175,8 @@ def gen_vh(m):
          '`define SS_WORD_BITS %d' % fmt['word_bits'],
          '`define SS_SLOTS %d' % fmt['slots'],
          "`define SS_SLOT_BYTES 32'h%X" % fmt['slot_bytes'],
+         "`define SS_DDR_BASE 32'h%X" % fmt['ddr_base'],
+         '`define SS_REU_PAGE_BYTES %d' % fmt['reu_page_bytes'],
          '`define SS_CHAIN_BITS %d' % m['chain_bits'], '']
     for s in m['segments']:
         n = s['name']
@@ -197,6 +204,8 @@ def gen_vh(m):
     for r in m['regions']:
         L += ["`define SS_TAG_%s 8'h%02X" % (r['name'], r['tag']),
               '`define SS_%s_BYTES %d' % (r['name'], r['bytes'])]
+        if 'pages_tag' in r:
+            L.append("`define SS_TAG_%s_PAGES 8'h%02X" % (r['name'].split('_')[0], r['pages_tag']))
     L.append('')
     for c in m['config_mask']:
         L.append('`define SS_CFG_%s %d' % (c['name'].upper(), c['offset']))
@@ -237,6 +246,9 @@ def gen_md(m):
         L.append('| 0x%02X | %s | %d | %s | %s | %s | %s |' % (
             r['tag'], r['name'], r['bytes'], r['port'], r.get('vice', ''), r.get('stage', ''),
             'yes' if r.get('optional') else ''))
+        if 'pages_tag' in r:
+            L.append('| 0x%02X | %s_PAGES | <= %d | %s | | | %s |' % (
+                r['pages_tag'], r['name'].split('_')[0], r['bytes'], r['port'], 'yes' if r.get('optional') else ''))
     L += ['', '## Config mask', '', '| Bits | Name | OSD status | Note |', '| --- | --- | --- | --- |']
     for c in m['config_mask']:
         hi = c['offset'] + c['bits'] - 1

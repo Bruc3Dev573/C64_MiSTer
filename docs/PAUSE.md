@@ -20,7 +20,9 @@ so HDMI holds a whole frame. `fpga64_sid_iec` stops the machine on the
 refresh cycle (`sysEnable` low, `sysCycle` held at `CYCLE_EXT4`); its
 `pause_out` (`c64_pause`) holds the 1541/1581 drives, `video_sync` and the
 blocks of "Leaks closed". The savestate engine stops the machine through the
-same pause input (`ss_freeze`, `docs/SAVESTATES.md` "Freeze").
+same pause input (`ss_freeze`, `docs/SAVESTATES.md` "Freeze"). A save or a
+load stops it for 2-3 frames, and up to ~0.6 s for a save of a full 16 MiB
+REU (D13).
 
 ### Picture and sync while stopped (analog output)
 

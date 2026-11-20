@@ -35,5 +35,6 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestate/savestate_ui.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestate/ss_freeze.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestate/ss_sdram_port.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestate/ss_ddram_arb.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestate/ss_reu_map.sv
 set_global_assignment -name SYSTEMVERILOG_FILE c64.sv
 set_global_assignment -name SDC_FILE c64.sdc

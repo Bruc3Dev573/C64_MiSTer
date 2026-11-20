@@ -11,8 +11,8 @@
 // load verified.
 
 module statemanager #(
-	parameter [28:0] BASE       = 29'h07C00000,   // 0x3E000000 / 8
-	parameter [28:0] SLOT_WORDS = 29'h00100000    // 8 MiB / 8
+	parameter [28:0] BASE       = 29'h05580000,   // 0x2AC00000 / 8 (D13)
+	parameter [28:0] SLOT_WORDS = 29'h002A0000    // 21 MiB / 8
 )
 (
 	input             clk,
@@ -50,7 +50,7 @@ reg  [2:0] tstep = 0;               // 0 idle, 1..4 steps
 reg [31:0] crc1 = 0, crc2 = 0;
 reg        tok = 0;
 
-wire [28:0] scratch = BASE - SLOT_WORDS;          // 0x3D800000 with 8 MiB slots
+wire [28:0] scratch = BASE - SLOT_WORDS;          // 0x29700000 with 21 MiB slots
 
 always @(posedge clk) begin
 	reg save_dispatched, load_dispatched;
