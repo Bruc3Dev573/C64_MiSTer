@@ -352,8 +352,9 @@ messages 24-26, Pause Mute Audio on the user pause), the harness
 
 ## D13 - REU 16 MiB in the slots: 21 MiB slots lower in DDR3, written REU pages only, block transport (2026-11-14)
 
-(D11 and D12 are taken by the A13 branch. The rewind ring that D13 mentions
-is not part of this branch, see D10; nothing else of D13 depends on it.)
+(D11 and D12 belong to a rewind development branch that is not public. The
+rewind ring that D13 mentions is not part of this branch, see D10; nothing
+else of D13 depends on it.)
 
 **Data.**
 - With 8 MiB slots at 0x3E000000 (D2) a save with the 16 MiB REU is refused
@@ -378,20 +379,20 @@ is not part of this branch, see D10; nothing else of D13 depends on it.)
   smaller, older file loads) and writes `(STATESIZE + 2) * 4` bytes when
   they fit; the token is limited to 128 MiB per slot and base + 4 slots
   below 0x40000000.
-- A13 (c5290fa) moved the SDRAM regions in 8-column bursts while frozen
-  (`ss_sdram_port.sv`, an engine path in sdram.v).
+- The rewind development branch moved the SDRAM regions in 8-column bursts
+  while frozen (`ss_sdram_port.sv`, an engine path in sdram.v).
 
 **Decision.**
 - Slots: `SS2AC00000:1500000`, four slots of 21 MiB at 0x2AC00000-
   0x2FFFFFFF, the self-test scratch slot at 0x29700000-0x2ABFFFFF. Main is
   unchanged. The drive images keep 0x30000000-0x30FFFFFF (the only window
   where the arbiter now accepts drive writes), the ring stays at 0x3C000000.
-  After a merge with A13 its area 0x31000000-0x3CFFFFFF stays as it is and
+  After a merge with the rewind branch its area 0x31000000-0x3CFFFFFF stays as it is and
   its scratch and slots (0x3D800000, 0x3E000000) move to these addresses.
 - Accepted cost: Main clears the whole SS area through /dev/mem (O_SYNC,
   shmem.cpp:22,30) on every file load and drive-8 mount: 84 MiB instead of
   32 MiB, estimated +0.3 to +1.1 s at 50-200 MB/s (not measured). The board
-  measurement (A12v against A12r, same PRG) decides.
+  measurement (the builds before and after D13, same PRG) decides.
 - Format version 2. The REU is saved as REU_PAGES (tag 0x15): for every
   4 KiB page written since power on, one record word `{4096, page index}`
   and the 512 words of the page, page indexes strictly increasing. All other
@@ -432,9 +433,9 @@ is not part of this branch, see D10; nothing else of D13 depends on it.)
   column per clk64 (137 clk_sys per transfer): every simulation checker
   passed, but on the board the saved bytes had single bits of the next column
   (screen RAM "**** COMMODORE" saved as 28 2a 2a 2a 20 21 0f 0d 0d 0d ...),
-  without a REU and with one, while A12v saved the same state exactly: the
-  next column reached the DQ input register at the capture edge. A13 reads
-  one column every other clk64 and was exact on the board. The command-level
+  without a REU and with one, while the build before D13 saved the same state exactly: the
+  next column reached the DQ input register at the capture edge. The rewind
+  branch reads one column every other clk64 and was exact on the board. The command-level
   checker cannot see pad timing (sim/README.md); a board test checks a known
   pattern in RAM and in every REU bank byte
   for byte on the board, through a save and a load. The first transfer after
@@ -452,7 +453,7 @@ is not part of this branch, see D10; nothing else of D13 depends on it.)
 - Rewind stays off with any REU (D10).
 
 **Changes.** `rtl/sdram.v` (engine sequencer, gated by `ss_own`; the normal
-path is unchanged while it is low), `ss_sdram_port.sv` (rewritten after A13:
+path is unchanged while it is low), `ss_sdram_port.sv` (rewritten after the rewind branch:
 transfers, power-on fill), `savestates.sv` (streaming engine: FIFO, DDR3
 bursts, CRC 8 bytes per clock, REU_PAGES, verify pass), `ss_ddram_arb.sv`
 (burst arbitration, drive write window), `ss_reu_map.sv` (new),

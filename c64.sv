@@ -1591,7 +1591,19 @@ wire [7:0] r_out = pause_dim ? {1'b0, vr[7:1]} : vr;
 wire [7:0] g_out = pause_dim ? {1'b0, vg[7:1]} : vg;
 wire [7:0] b_out = pause_dim ? {1'b0, vb[7:1]} : vb;
 
-assign HDMI_FREEZE = freeze | ss_frz_ack;
+// The scaler freeze of a savestate operation also changes only on a frame
+// boundary (freeze_sync), as freeze does: released mid-frame, ascal took the
+// frame being written as complete and showed its top lines from an old
+// buffer (one garbage frame on HDMI after some saves and loads).
+reg ss_hdmi_frz = 0;
+always @(posedge clk_sys) begin
+	reg old_sync;
+
+	old_sync <= freeze_sync;
+	if(old_sync ^ freeze_sync) ss_hdmi_frz <= ss_frz_ack;
+end
+
+assign HDMI_FREEZE = freeze | ss_hdmi_frz;
 
 ///////////////////////////////// savestates (WP A2) /////////////////////////////////
 // docs/SAVESTATES.md. Four 21 MiB slots in DDR3 at 0x2AC00000 (SS2AC00000:1500000,

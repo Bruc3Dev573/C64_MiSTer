@@ -158,6 +158,9 @@ Main shows the video info). It also checks the VIC raster offsets
 `video_sync` takes its stop position from, while the machine runs: hsync_out
 rises at VIC X 407 PAL / 413 NTSC, vsync_out on VIC line 296 PAL / 12 NTSC,
 `vic_y` steps only at X 404 PAL / 420 NTSC, the machine stops at X = 8n+6.
+`HDMI_FREEZE` changes only in the clk_sys sample of a `freeze_sync` toggle or
+the two after it (a frame boundary of the scaler; the negative control with
+the savestate freeze following `ss_frz_ack` at once fails it).
 Every resume comes at most one frame after the release (the last fall of
 `freeze` or `ss_frz_ack`, or an engine request: a user-paused machine runs to
 its savestate boundary only on the video position, `ss_freeze` `run_ok`), a

@@ -584,6 +584,8 @@ struct Sim {
 		int stop_loads = 0;
 		uint32_t y0 = 0, x0 = 0, old_y = 0;
 		u64 freed_at = 0;              // clk_sys of the release in this stop
+		bool old_fs = false, old_hf = false;
+		uint8_t fs_tog = 0;            // freeze_sync toggles of the last clk_sys samples (bit 0 newest)
 	} sm;
 	uint32_t vic_x() { return EM(vic_x); }
 	uint32_t vic_y() { return EM(vic_y); }
@@ -669,6 +671,16 @@ struct Sim {
 		if (y != m.old_y && !p && !m.old_pause && x != y_step && sm_bad())
 			printf("sync: %s VIC line %u -> %u at X %u, expected X %u, clk_sys %llu\n", top->name(), m.old_y, y, x, y_step, (unsigned long long)sys_cycles);
 		m.old_y = y;
+		// HDMI_FREEZE (user/OSD freeze and the savestate's scaler freeze) changes
+		// only on a frame boundary of the scaler: registered on the clk_sys edge
+		// that sees a freeze_sync toggle (clk64), so in the sample of the toggle
+		// or up to two later. A change mid-frame let ascal show a frame whose
+		// top lines came from an old buffer.
+		bool fs = EM(freeze_sync), hf = top->HDMI_FREEZE;
+		m.fs_tog = (m.fs_tog << 1) | (fs != m.old_fs);
+		if (hf != m.old_hf && !(m.fs_tog & 7) && sm_bad())
+			printf("sync: %s HDMI_FREEZE %s off a scaler frame boundary, clk_sys %llu\n", top->name(), hf ? "rose" : "fell", (unsigned long long)sys_cycles);
+		m.old_fs = fs; m.old_hf = hf;
 		if (p && !m.old_pause) {
 			m.stop_at = m.freed_at = sys_cycles; m.stop_loads = 0; m.y0 = y; m.x0 = x;
 			if (x % 8 != 6 && sm_bad())

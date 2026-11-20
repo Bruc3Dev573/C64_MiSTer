@@ -56,6 +56,13 @@ While `HDMI_FREEZE` is high (user/OSD pause, savestate operation) the
 freezer of `sys/video_mixer.sv` blanks the picture and regenerates the sync
 it measured before; `pause_fb` shows on the output, and goes into the scaler,
 in the stopped clocks without it, e.g. the realignment wait after a release.
+`HDMI_FREEZE` changes only on a frame boundary of the scaler (`freeze_sync`),
+for the OSD pause and for a savestate operation alike: the savestate part
+(`ss_hdmi_frz`) follows `ss_frz_ack` on the next `freeze_sync` toggle. When the
+savestate part followed `ss_frz_ack` at once, a release mid-frame let ascal
+take the frame it was writing as complete, and HDMI showed one frame whose
+top lines came from an old buffer (on the board: 5 of 22 saves and loads on one
+build, 0 of 28 with the fix).
 
 The position of the stopped VIC comes from its raster counters, through
 read-only taps (`vic_x`/`vic_y` of `fpga64_sid_iec`: rasterX, and rasterY

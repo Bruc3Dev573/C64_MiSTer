@@ -715,21 +715,23 @@ input `ring`, UI; chain, slot format and M10K unchanged): 34,846 ALMs (83 %,
 +95), 39,336 registers, M10K 503 / 553, worst setup slack +0.617 ns (HDMI
 clock), worst hold +0.245 ns; clk_sys +2.114 / +0.256 ns, clk64 +1.812 /
 +0.245 ns, clk48 +2.611 / +0.253 ns. D13 (block transport with READs every
-other clk64, REU page map, 21 MiB slots, power-on fill under reset;
-`C64_A12r.rbf`, md5 `237c89151a787440e45d2adbb2a46e11`): 35,725 ALMs (85 %,
-+744 over A12v's 34,981), 40,088 registers, M10K 504 / 553 (+1: the REU page
+other clk64, REU page map, 21 MiB slots, power-on fill under reset): 35,725 ALMs
+(85 %, +744 over the build before, 34,981), 40,088 registers, M10K 504 / 553 (+1: the REU page
 map; the engine FIFO is an MLAB), worst setup slack +0.195 ns (HDMI clock),
 worst hold +0.173 ns (HDMI clock); clk_sys +2.863 / +0.254 ns, clk64 +1.433 /
 +0.252 ns, clk48 +2.969 / +0.417 ns. The `sdram.v` I/O registers stay packed into the
 I/O cells as in A12: the same 68 register/pin pairs (16 DQ input, 16 DQ
 output enable, 36 output registers). D13 with the load sync fix of
 `savestates` (merge of `9a607eb`: `vic_x`/`vic_y` taps into `video_sync`,
-`ss_freeze` `run_ok`; `C64_A12rs.rbf`, md5
-`4a677c9291015139bc00c6b59692dbd8`, clean database): 35,801 ALMs (85 %, +76),
+`ss_freeze` `run_ok`, clean database): 35,801 ALMs (85 %, +76),
 39,963 registers, M10K 504 / 553, DSP 60, worst setup slack +0.127 ns (HDMI
 clock), worst hold +0.241 ns (clk64); HDMI +0.127 / +0.259 ns, clk_sys
 +1.629 / +0.263 ns, clk64 +1.167 / +0.241 ns, clk48 +2.516 / +0.252 ns; the
-same 68 I/O register/pin pairs.
+same 68 I/O register/pin pairs. v0.1.0-pre2 (no rewind ring, the scaler
+freeze of a savestate on frame boundaries): 35,767 ALMs (85 %), M10K
+504 / 553, worst setup slack +0.444 ns (HDMI clock), worst hold +0.201 ns;
+with the Pause button 35,814 ALMs, +0.036 / +0.154 ns (HDMI clock, the
+polyphase filter of the scaler); the same 68 I/O register/pin pairs.
 
 **Local change of the framework (A11).** `sys/ascal.vhd` (the MiSTer scaler,
 identical to Template_MiSTer master, which has no newer version of it) is

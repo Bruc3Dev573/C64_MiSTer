@@ -414,6 +414,9 @@
 - match: "emu.old_sync"
   class: ignored
   reason: edge detector of freeze_sync from the scaler (framework)
+- match: "emu.old_sync#2"
+  class: ignored
+  reason: edge detector of freeze_sync for the savestate part of HDMI_FREEZE (framework)
 - match: "emu.pause_att"
   class: ignored
   reason: pause audio fade (framework, audio output)
