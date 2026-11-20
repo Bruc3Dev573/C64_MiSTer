@@ -72,7 +72,7 @@ assign HDMI_BOB_DEINT = 0;
 `include "build_id.v"
 localparam CONF_STR = {
 	// Main reads the SS (savestate area) and UART tokens only from this second field, comma separated
-	"C64;SS3E000000:800000,UART9600:2400;",
+	"C64;SS2AC00000:1500000,UART9600:2400;",
 	"H7S0,D64G64T64D81,Mount #8;",
 	"H0S1,D64G64T64D81,Mount #9;",
 	"O[77:76],Mount Write Protected,Off,#8,#9,#8 & #9;",
@@ -310,6 +310,7 @@ reg ntsc_sys1 = 0, ntsc = 0;
 reg reset_n;
 reg reset_wait = 0;
 reg ntsc_prev = 0;
+reg ss_reu_clr = 1;      // power-on zero fill of the REU lane (savestates, D13): the machine waits in reset
 
 always @(posedge clk_sys) begin
 	integer reset_counter;
@@ -325,7 +326,7 @@ always @(posedge clk_sys) begin
 	reset_n <= !reset_counter;
 	old_download <= ioctl_download;
 
-	if (RESET | status[0] | status[17] | buttons[1] | !pll_locked | (ntsc_prev != ntsc)) begin
+	if (RESET | status[0] | status[17] | buttons[1] | !pll_locked | ss_reu_clr | (ntsc_prev != ntsc)) begin
 		if(RESET) do_erase <= 1;
 		reset_counter <= 100000;
 	end
@@ -400,9 +401,11 @@ wire        ss_status_upd;
 wire        ss_info_req;
 wire  [7:0] ss_info;
 wire        tape_ss_idle;
-wire        ss_sd_own, ss_sd_ce, ss_sd_we;
+wire        ss_sd_own;                               // the savestate engine owns the SDRAM (normal ce masked)
+wire        ss_sd_req, ss_sd_we;                     // sdram.v engine transfers (ss_sdram_port)
 wire [24:0] ss_sd_addr;
-wire  [7:0] ss_sd_din;
+wire [63:0] ss_sd_din, ss_sd_dout;
+wire        ss_sd_wtgl, ss_sd_rtgl, ss_sd_dtgl;
 reg         ss_cram_act = 0;
 reg         ss_cram_we = 0;
 reg   [9:0] ss_cram_addr = 0;
@@ -505,7 +508,7 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(2), .BLKSZ(1)) hps_io
 	.ioctl_upload(ioctl_upload),
 	.ioctl_din(ioctl_din),
 	.ioctl_rd(ioctl_rd),
-	.ioctl_wait(ioctl_req_wr|ioctl_req_rd|reset_wait|tape_ioctl_wait)
+	.ioctl_wait(ioctl_req_wr|ioctl_req_rd|reset_wait|tape_ioctl_wait|ss_reu_clr)
 );
 
 wire load_prg   = ioctl_index == 'h01;
@@ -996,6 +999,17 @@ end
 assign SDRAM_CKE  = 1;
 
 wire [7:0] sdram_data;
+
+// the machine's SDRAM accesses (io_cycle: host and cartridge write-back,
+// ext_cycle: REU DMA, else the C64 bus); while the savestate engine owns the
+// SDRAM their ce is masked (the machine is frozen or, for the power-on REU
+// fill, held in reset; the port lets go on a refresh pulse, where ce is low)
+// and sdram.v runs the engine transfers
+wire [24:0] sdm_addr = io_cycle ? (cart_mem_req ? cart_addr   : io_cycle_addr ) : ext_cycle ? reu_ram_addr : cart_addr;
+wire        sdm_ce   = io_cycle ? (cart_mem_req ? cart_ce     : io_cycle_ce   ) : ext_cycle ? reu_ram_ce   : cart_ce;
+wire        sdm_we   = io_cycle ? (cart_mem_req ? cart_we     : io_cycle_we   ) : ext_cycle ? reu_ram_we   : cart_we;
+wire  [7:0] sdm_din  = io_cycle ? (cart_mem_req ? cart_wrdata : io_cycle_data ) : ext_cycle ? reu_ram_dout : cart_wrdata;
+
 sdram sdram
 (
 	.sd_addr(SDRAM_A),
@@ -1011,11 +1025,21 @@ sdram sdram
 	.clk(clk64),
 	.init(~pll_locked),
 	.refresh(refresh),
-	.addr( ss_sd_own ? ss_sd_addr : io_cycle ? (cart_mem_req ? cart_addr   : io_cycle_addr ) : ext_cycle ? reu_ram_addr : cart_addr   ),
-	.ce  ( ss_sd_own ? ss_sd_ce   : io_cycle ? (cart_mem_req ? cart_ce     : io_cycle_ce   ) : ext_cycle ? reu_ram_ce   : cart_ce     ),
-	.we  ( ss_sd_own ? ss_sd_we   : io_cycle ? (cart_mem_req ? cart_we     : io_cycle_we   ) : ext_cycle ? reu_ram_we   : cart_we     ),
-	.din ( ss_sd_own ? ss_sd_din  : io_cycle ? (cart_mem_req ? cart_wrdata : io_cycle_data ) : ext_cycle ? reu_ram_dout : cart_wrdata ),
-	.dout( sdram_data )
+	.addr(sdm_addr),
+	.ce(~ss_sd_own & sdm_ce),
+	.we(sdm_we),
+	.din(sdm_din),
+	.dout(sdram_data),
+
+	.ss_own(ss_sd_own),
+	.ss_req(ss_sd_req),
+	.ss_we(ss_sd_we),
+	.ss_addr(ss_sd_addr),
+	.ss_din(ss_sd_din),
+	.ss_wtgl(ss_sd_wtgl),
+	.ss_dout(ss_sd_dout),
+	.ss_rtgl(ss_sd_rtgl),
+	.ss_dtgl(ss_sd_dtgl)
 );
 
 wire  [7:0] c64_data_out;
@@ -1570,8 +1594,9 @@ wire [7:0] b_out = pause_dim ? {1'b0, vb[7:1]} : vb;
 assign HDMI_FREEZE = freeze | ss_frz_ack;
 
 ///////////////////////////////// savestates (WP A2) /////////////////////////////////
-// docs/SAVESTATES.md. Four 8 MiB slots in DDR3 at 0x3E000000 (SS3E000000:800000),
-// the scratch slot of the OSD self-test is the 8 MiB below them (0x3D800000).
+// docs/SAVESTATES.md. Four 21 MiB slots in DDR3 at 0x2AC00000 (SS2AC00000:1500000,
+// D13), the scratch slot of the OSD self-test is the 21 MiB below them
+// (0x29700000).
 
 `include "rtl/savestate/c64_savestates.vh"
 
@@ -1637,15 +1662,19 @@ wire        ss_busy, ss_done, ss_result_load, ss_loading;
 wire  [3:0] ss_result;
 wire [31:0] ss_crc;
 wire [28:0] ss_ddr_addr;
-wire [63:0] ss_ddr_wdata, ss_ddr_rdata;
-wire  [7:0] ss_ddr_be;
-wire        ss_ddr_req, ss_ddr_we, ss_ddr_ack;
+wire  [7:0] ss_ddr_burstcnt, ss_ddr_be;
+wire [63:0] ss_ddr_wdata;
+wire        ss_ddr_rd, ss_ddr_we, ss_ddr_busy, ss_ddr_rvalid;
+wire        ss_sdr_req, ss_sdr_we, ss_sdr_zero, ss_sdr_ready, ss_sdr_rvalid, ss_sdr_wtake;
+wire [63:0] ss_sdr_rdata, ss_sdr_wdata;
+wire [11:0] ss_map_addr;
+wire        ss_map_q, ss_map_we, ss_map_wdata;
 wire        ss_eng_save, ss_eng_load, ss_eng_hold;
 wire [28:0] ss_eng_addr;
 wire        ss_inhibit = ioctl_download | ioctl_upload | ~reset_n | erasing | inj_meminit;
 
 // REU_RAM region: the REU is in the SDRAM at REU_ADDR, size from the OSD option.
-// 512 KiB and 2 MiB fit an 8 MiB slot; 16 MiB is refused (docs/SAVESTATES.md).
+// Its pages written since power on go into the slot (D13).
 wire [24:0] ss_reu_bytes = (reu_cfg == 2'd1) ? 25'h0080000 :
                            (reu_cfg == 2'd2) ? 25'h0200000 :
                            (reu_cfg == 2'd3) ? 25'h1000000 : 25'd0;
@@ -1713,14 +1742,29 @@ savestates #(.BUILD_HASH(SS_BUILD_HASH), .LIVE((32'd1 << `SS_SEG_CPU) | (32'd1 <
 	.rgn_wdata(ss_rgn_wdata),
 	.rgn_rdata(ss_rgn_rdata),
 	.rgn_ack(ss_rgn_ack),
+	.sd_req(ss_sdr_req),
+	.sd_we(ss_sdr_we),
+	.sd_zero(ss_sdr_zero),
+	.sd_ready(ss_sdr_ready),
+	.sd_rvalid(ss_sdr_rvalid),
+	.sd_rdata(ss_sdr_rdata),
+	.sd_wtake(ss_sdr_wtake),
+	.sd_wdata(ss_sdr_wdata),
+
+	.map_addr(ss_map_addr),
+	.map_q(ss_map_q),
+	.map_we(ss_map_we),
+	.map_wdata(ss_map_wdata),
 
 	.ddr_addr(ss_ddr_addr),
+	.ddr_burstcnt(ss_ddr_burstcnt),
+	.ddr_rd(ss_ddr_rd),
+	.ddr_we(ss_ddr_we),
 	.ddr_wdata(ss_ddr_wdata),
 	.ddr_be(ss_ddr_be),
-	.ddr_req(ss_ddr_req),
-	.ddr_we(ss_ddr_we),
-	.ddr_rdata(ss_ddr_rdata),
-	.ddr_ack(ss_ddr_ack)
+	.ddr_busy(ss_ddr_busy),
+	.ddr_rdata(DDRAM_DOUT),
+	.ddr_rvalid(ss_ddr_rvalid)
 );
 
 // Scan chain, in clk_sys: engine -> [segment with the highest map word
@@ -1732,14 +1776,9 @@ savestates #(.BUILD_HASH(SS_BUILD_HASH), .LIVE((32'd1 << `SS_SEG_CPU) | (32'd1 <
 // (cartridge, DigiMax) -> REU -> ss_ext_si -> SID2 -> SID1 -> CIA2 -> CIA1 ->
 // VIC -> CPU (fpga64).
 
-// SDRAM regions through the paced port: RAM 0x0000000, cartridge RAM banks
-// 0x0010000 (cartridge.v get_bank), EasyFlash flash 0x0200000 (ezmem_addr),
-// GeoRAM 0x0C00000 ({3'b011, geo_bank}), REU 0x1000000 (REU_ADDR)
-reg        ss_sd_req = 0;
-wire       ss_sd_ack;
-wire [7:0] ss_sd_rdata;
-wire       ss_rgn_is_sd = (ss_rgn_tag == `SS_TAG_RAM) || (ss_rgn_tag == `SS_TAG_REU_RAM) || (ss_rgn_tag == `SS_TAG_GEORAM) ||
-                          (ss_rgn_tag == `SS_TAG_CART_RAM) || (ss_rgn_tag == `SS_TAG_CART_FLASH);
+// SDRAM regions in 256-byte transfers of sdram.v: RAM 0x0000000, cartridge
+// RAM banks 0x0010000 (cartridge.v get_bank), EasyFlash flash 0x0200000
+// (ezmem_addr), GeoRAM 0x0C00000 ({3'b011, geo_bank}), REU 0x1000000 (REU_ADDR)
 reg [24:0] ss_rgn_sd_addr;
 always @* begin
 	case (ss_rgn_tag)
@@ -1750,28 +1789,51 @@ always @* begin
 		default:            ss_rgn_sd_addr = {9'd0, ss_rgn_addr[15:0]};
 	endcase
 end
-always @(posedge clk_sys) begin
-	if (ss_rgn_req & ss_rgn_is_sd) ss_sd_req <= 1;
-	else if (ss_sd_ack) ss_sd_req <= 0;
-end
 
-ss_sdram_port ss_sdram
+wire ss_reu_clr_done;
+always @(posedge clk_sys) if (ss_reu_clr_done) ss_reu_clr <= 0;
+
+ss_sdram_port #(.CLR_BASE(REU_ADDR)) ss_sdram
 (
 	.clk(clk_sys),
 	.refresh(refresh),
 	.enable(ss_frz_ack & ss_busy),
-	.req(ss_sd_req),
-	.we(ss_rgn_we),
+	.clear(ss_reu_clr),
+	.clear_done(ss_reu_clr_done),
+
+	.req(ss_sdr_req),
+	.we(ss_sdr_we),
+	.zero(ss_sdr_zero),
 	.addr(ss_rgn_sd_addr),
-	.wdata(ss_rgn_wdata),
-	.ack(ss_sd_ack),
-	.rdata(ss_sd_rdata),
+	.ready(ss_sdr_ready),
+	.rvalid(ss_sdr_rvalid),
+	.rdata(ss_sdr_rdata),
+	.wtake(ss_sdr_wtake),
+	.wdata(ss_sdr_wdata),
+
 	.own(ss_sd_own),
-	.ce(ss_sd_ce),
+	.sd_req(ss_sd_req),
 	.sd_we(ss_sd_we),
 	.sd_addr(ss_sd_addr),
 	.sd_din(ss_sd_din),
-	.sd_dout(sdram_data)
+	.sd_wtgl(ss_sd_wtgl),
+	.sd_rtgl(ss_sd_rtgl),
+	.sd_dtgl(ss_sd_dtgl),
+	.sd_dout(ss_sd_dout)
+);
+
+// REU pages written since power on (D13): every write of the machine into
+// the REU lane of the SDRAM (REU DMA, REU file load, any other writer)
+ss_reu_map ss_reu_pages
+(
+	.clk(clk_sys),
+	.trk_we(~ss_sd_own & sdm_ce & sdm_we & sdm_addr[24]),
+	.trk_page(sdm_addr[23:12]),
+	.eng_we(ss_map_we),
+	.eng_page(ss_map_addr),
+	.eng_bit(ss_map_wdata),
+	.rd_page(ss_map_addr),
+	.q(ss_map_q)
 );
 
 // Color RAM: the engine borrows the fpga64 port (spram, 1 clock read latency)
@@ -1803,9 +1865,8 @@ assign ss_drv_rgn_sel = {ss_rgn_tag == `SS_TAG_TRACK_DRV9, ss_rgn_tag == `SS_TAG
 assign ss_drv_rgn_sel81 = {ss_rgn_tag == `SS_TAG_FDC_BUF_9, ss_rgn_tag == `SS_TAG_RAM_1581_9,
                            ss_rgn_tag == `SS_TAG_FDC_BUF_8, ss_rgn_tag == `SS_TAG_RAM_1581_8};
 
-assign ss_rgn_ack   = ss_sd_ack | ss_cram_ack | ss_drv_rgn_ack | ss_opl_rgn_ack;
-assign ss_rgn_rdata = ss_cram_ack ? {4'h0, ss_cram_q} : ss_drv_rgn_ack ? ss_drv_rgn_rdata :
-                      ss_opl_rgn_ack ? ss_opl_rgn_rdata : ss_sd_rdata;
+assign ss_rgn_ack   = ss_cram_ack | ss_drv_rgn_ack | ss_opl_rgn_ack;
+assign ss_rgn_rdata = ss_cram_ack ? {4'h0, ss_cram_q} : ss_drv_rgn_ack ? ss_drv_rgn_rdata : ss_opl_rgn_rdata;
 
 // DDR3: drive track cache and savestate engine
 ss_ddram_arb ss_ddr
@@ -1822,14 +1883,14 @@ ss_ddram_arb ss_ddr
 	.d_dout_ready(drv_ddram_ready),
 	.d_idle(ss_drv_ddr_idle),
 
-	.e_session(ss_busy),
-	.e_req(ss_ddr_req),
-	.e_we(ss_ddr_we),
+	.e_burstcnt(ss_ddr_burstcnt),
 	.e_addr(ss_ddr_addr),
-	.e_wdata(ss_ddr_wdata),
+	.e_rd(ss_ddr_rd),
+	.e_we(ss_ddr_we),
+	.e_din(ss_ddr_wdata),
 	.e_be(ss_ddr_be),
-	.e_ack(ss_ddr_ack),
-	.e_rdata(ss_ddr_rdata),
+	.e_busy(ss_ddr_busy),
+	.e_dout_ready(ss_ddr_rvalid),
 
 	.DDRAM_BUSY(DDRAM_BUSY),
 	.DDRAM_BURSTCNT(DDRAM_BURSTCNT),
@@ -1847,7 +1908,7 @@ wire [1:0] ss_active_slot;
 wire       ss_active_load, ss_active_test, ss_test_done, ss_test_pass;
 wire       ss_ui_save, ss_ui_load, ss_ui_test;
 
-statemanager #(.SLOT_WORDS(`SS_SLOT_BYTES >> 3)) ss_mgr
+statemanager #(.BASE(`SS_DDR_BASE >> 3), .SLOT_WORDS(`SS_SLOT_BYTES >> 3)) ss_mgr
 (
 	.clk(clk_sys),
 	.reset(~reset_n),

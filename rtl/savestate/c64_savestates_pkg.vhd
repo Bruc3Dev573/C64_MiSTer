@@ -5,10 +5,12 @@ use ieee.std_logic_1164.all;
 
 package c64_savestates_pkg is
 
-	constant SS_FORMAT_VERSION : natural := 1;
+	constant SS_FORMAT_VERSION : natural := 2;
 	constant SS_WORD_BITS      : natural := 64;
 	constant SS_SLOTS          : natural := 4;
-	constant SS_SLOT_BYTES     : natural := 16#800000#;
+	constant SS_SLOT_BYTES     : natural := 16#1500000#;
+	constant SS_DDR_BASE       : natural := 16#2AC00000#;
+	constant SS_REU_PAGE_BYTES : natural := 4096;
 	constant SS_CHAIN_BITS     : natural := 10445;
 
 	-- scan-chain segments: legacy word address, words reserved,
@@ -1703,6 +1705,7 @@ package c64_savestates_pkg is
 	constant SS_GEORAM_BYTES : natural := 4194304;
 	constant SS_TAG_REU_RAM : natural := 16#09#;
 	constant SS_REU_RAM_BYTES : natural := 16777216;
+	constant SS_TAG_REU_PAGES : natural := 16#15#;
 
 	-- config mask bit offsets
 	constant SS_CFG_REU_SIZE : natural := 0; -- 2 bits

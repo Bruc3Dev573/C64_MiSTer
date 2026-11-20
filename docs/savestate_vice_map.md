@@ -48,6 +48,7 @@ Chain length: 10445 bits (fields are filled by A1 and the chip WPs; a segment wi
 | 0x14 | CART_FLASH | 1048576 | sdram_walk |  | v1 | yes |
 | 0x08 | GEORAM | 4194304 | sdram_walk | GEORAM | v1 | yes |
 | 0x09 | REU_RAM | 16777216 | sdram_walk | REU1764 | v1 | yes |
+| 0x15 | REU_PAGES | <= 16777216 | sdram_walk | | | yes |
 
 ## Config mask
 

@@ -15,6 +15,9 @@
 //       source, cassette lines, audio mix). The two sample streams must be
 //       identical: B is A shifted by the paused time. Compares --after C
 //       samples after the resume.
+//       --sync-check (with --no-cache): A's output from power on to READY,
+//       across the power-on REU fill (machine in reset) and the hand-back of
+//       the SDRAM, must keep a regular sync and show a live picture.
 //
 // Common: --prg file  loads a PRG through ioctl (index 1) once READY is seen
 //         (Reset & Run PRG is the default, so it runs).
@@ -33,6 +36,8 @@
 //         --kbuf "LOAD\r"  puts the text in the KERNAL keyboard buffer (instant).
 //         --ram-prg file  puts a PRG straight into RAM after READY (no ioctl, no
 //                     reset; BASIC end pointers set for $0801), then --kbuf 'RUN\r'.
+//         --reu-fill  after READY, write all 16 MiB of the REU lane and mark every
+//                     REU page written (worst-case savestate; REU 16 MiB: --status 53,54).
 //         --run-cycles C  extra clk_sys cycles to run after READY in boot mode.
 //         --no-cache  do not reuse/write ready.state, the READY snapshot.
 //         --opl, --clk50  also run clk48 for OPL3 / CLK_50M, off by default.
@@ -44,7 +49,9 @@
 //                     the CPU fetches the opcode at $ADDR (hex), like the OSD
 //                     "Save state"; --slot file.ss then gets the slot image.
 //         --load-slot file.ss  boot mode: put the image in slot 1 and restore
-//                     it after READY/PRG (before --run-cycles).
+//                     it after READY/PRG (before --run-cycles). With either
+//                     option boot mode arms the output sync monitor and ends
+//                     with its "sync a:" verdict (exit 1 on FAIL).
 //
 //   Vemu sstest [--prg fill.prg --kbuf "SYS2061\r"] [--freeze-at C] [--slot f.ss]
 //       (the PRG is put into RAM directly, --kbuf starts it)
@@ -102,6 +109,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <csignal>
 #include "Vemu.h"
 #include "Vemu___024root.h"
 // Verilator keeps emu as its own class (rootp->emu) or flattens it into the
@@ -245,35 +253,45 @@ struct Sim {
 	bool old_hs = false, old_vs = false, any_de = false;
 
 	// DDR3 model (Avalon, clk_sys): sparse 64-bit words, random waitrequest,
-	// read bursts returned after a latency, as the HPS bridge does. The drive
-	// track cache (word addresses below the self-test area 0x07B00000) gets
-	// its waitrequest and latency from an RNG that steps only on clocks where
-	// the drives run, and its read beats count down and arrive only then: an
-	// instance that pauses or saves sees the same drive DMA timing as one that
-	// never stops (the drives issue no request while stopped). The drives run
-	// on the next clock when c64_pause was low on the previous one (c1541_multi stop).
+	// read bursts returned after a latency, write bursts beat by beat from the
+	// address of their first beat, as the HPS bridge does. The drive track
+	// cache (word addresses of the drive image window 0x06000000-0x061FFFFF,
+	// bytes 0x30000000-0x30FFFFFF) gets its waitrequest and latency from an
+	// RNG that steps only on clocks where the drives run, and its read beats
+	// count down and arrive only then: an instance that pauses or saves sees
+	// the same drive DMA timing as one that never stops (the drives issue no
+	// request while stopped). The drives run on the next clock when c64_pause
+	// was low on the previous one (c1541_multi stop).
 	struct Beat { uint32_t addr; int wait; bool drv; };
 	std::unordered_map<uint32_t, std::vector<u64>> ddr;
 	std::deque<Beat> rdq;
 	uint32_t ddr_rng = 12345, drv_rng = 54321;
 	uint8_t phist = 0;     // c64_pause after the last three clocks, bit 0 = last
 	u64 ddr_wr = 0, ddr_rd = 0;
+	uint32_t wb_addr = 0;  // write burst in progress: address of its next beat, beats left
+	int wb_left = 0;
 	u64 &ddr_word(uint32_t a) {
 		auto &pg = ddr[a >> 16];
 		if (pg.empty()) pg.assign(65536, 0);
 		return pg[a & 0xFFFF];
 	}
+	static bool drv_window(uint32_t a) { return (a >> 21) == 0x30; }
 	void ddram() {
 		ddr_rng = ddr_rng * 1103515245u + 12345u;
 		phist = (uint8_t)((phist << 1) | EM(c64_pause));
 		bool run = !(phist & 2);
 		if (run) drv_rng = drv_rng * 1103515245u + 12345u;
-		bool drv = top->DDRAM_ADDR < 0x07B00000u;
+		bool drv = drv_window(top->DDRAM_ADDR);
 		uint32_t rng = drv ? drv_rng : ddr_rng;
 		bool busy = ((rng >> 16) & 7) == 0;
 		top->DDRAM_BUSY = busy;
 		if (!busy && top->DDRAM_WE) {
-			u64 &w = ddr_word(top->DDRAM_ADDR);
+			if (!wb_left) {
+				wb_addr = top->DDRAM_ADDR;
+				wb_left = top->DDRAM_BURSTCNT ? top->DDRAM_BURSTCNT : 1;
+			}
+			u64 &w = ddr_word(wb_addr++);
+			wb_left--;
 			u64 d = top->DDRAM_DIN;
 			for (int i = 0; i < 8; i++)
 				if ((top->DDRAM_BE >> i) & 1) w = (w & ~(0xFFull << (8 * i))) | (d & (0xFFull << (8 * i)));
@@ -298,16 +316,18 @@ struct Sim {
 	// host side of B at the fork of a two-instance test: B starts as A
 	void copy_host(const Sim &o) {
 		ddr = o.ddr; rdq = o.rdq; ddr_rng = o.ddr_rng; drv_rng = o.drv_rng; phist = o.phist;
+		wb_addr = o.wb_addr; wb_left = o.wb_left;
 		mount_cnt = o.mount_cnt; sd_ack_cnt = o.sd_ack_cnt;
 		sdimg[0] = o.sdimg[0]; sdimg[1] = o.sdimg[1]; sdx = o.sdx;
 	}
 
-	// savestate slots: 4 x 8 MiB at DDR3 0x3E000000 (word 0x07C00000)
-	static uint32_t slot_base(int n) { return 0x07C00000u + 0x100000u * n; }
-	std::vector<uint8_t> slot_image(int n) {
-		uint32_t b = slot_base(n);
+	// savestate slots: 4 x 21 MiB at DDR3 0x2AC00000 (word 0x05580000, D13)
+	static const uint32_t SLOT_WORDS = 0x2A0000u;
+	static uint32_t slot_base(int n) { return 0x05580000u + SLOT_WORDS * n; }
+	std::vector<uint8_t> slot_image(int n) { return image(slot_base(n)); }
+	std::vector<uint8_t> image(uint32_t b) {
 		uint32_t words = (uint32_t)(ddr_word(b) >> 33);
-		if (words > 0x100000) words = 0;
+		if (words > SLOT_WORDS) words = 0;
 		std::vector<uint8_t> v(words * 8);
 		for (uint32_t i = 0; i < words; i++) {
 			u64 w = ddr_word(b + i);
@@ -506,6 +526,7 @@ struct Sim {
 	bool vrec = false;
 	std::vector<uint32_t> vstream;
 	std::vector<uint8_t> vpaused;   // c64_pause at that sample
+	size_t vfill_end = 0;           // first sample after the power-on REU fill (D13)
 
 	void video() {
 		// sampled on clk64 rising edges with CE_PIXEL
@@ -514,6 +535,7 @@ struct Sim {
 			vstream.push_back(((uint32_t)top->VGA_HS << 31) | ((uint32_t)top->VGA_VS << 30) | ((uint32_t)top->VGA_DE << 29) |
 				(top->VGA_DE ? ((top->VGA_R << 16) | (top->VGA_G << 8) | top->VGA_B) : 0));
 			vpaused.push_back(EM(c64_pause));
+			if (!vfill_end && !EM(ss_reu_clr)) vfill_end = vstream.size();
 		}
 		bool hs = top->VGA_HS, vs = top->VGA_VS;
 		if (hs && !old_hs) {
@@ -897,6 +919,43 @@ static bool check_pause_video(Sim &a, Sim &b, u64 paused_cycles) {
 	return true;
 }
 
+// --sync-check: the core video output from power on to READY (the power-on
+// REU fill with the machine in reset, the SDRAM handed back to it at
+// vfill_end, the boot). Every line or frame of another length is listed; the
+// start-up of the first frame after power on (video_sync locking its counters
+// to the VIC) is allowed, nothing after the second vsync is. The picture must
+// change from the first frame to the last.
+static bool check_sync(Sim &s) {
+	const auto &V = s.vstream;
+	size_t hp = s.status_bit(2) ? 520 : 504, vp = s.frame_cycles() / 4, bad = 0, late = 0;
+	std::vector<size_t> hs, vs;
+	for (size_t i = 1; i < V.size(); i++) {
+		if ((V[i] >> 31 & 1) && !(V[i - 1] >> 31 & 1)) hs.push_back(i);
+		if ((V[i] >> 30 & 1) && !(V[i - 1] >> 30 & 1)) vs.push_back(i);
+	}
+	if (vs.size() < 3 || vs[0] + 2 * vp > V.size()) {
+		printf("FAIL sync: %zu samples, %zu vsync edges (record from power on: --no-cache)\n", V.size(), vs.size());
+		return false;
+	}
+	for (size_t i = 1; i < hs.size(); i++)
+		if (hs[i] - hs[i - 1] != hp) {
+			late += hs[i] > vs[1];
+			if (bad++ < 20) printf("sync: hsync period %zu at sample %zu\n", hs[i] - hs[i - 1], hs[i]);
+		}
+	for (size_t i = 1; i < vs.size(); i++)
+		if (vs[i] - vs[i - 1] != vp) {
+			late += i > 1;
+			if (bad++ < 20) printf("sync: vsync period %zu at sample %zu\n", vs[i] - vs[i - 1], vs[i]);
+		}
+	bool moved = false;   // last frame against the first one, same position
+	for (size_t i = V.size() - vp; i < V.size() && !moved; i++) moved = V[i] != V[vs[0] + (i - vs[0]) % vp];
+	bool ok = !late && moved;
+	printf("sync: %s, power on to READY %zu frames (vsync at samples %zu, %zu, ...; %zu dots per line, %zu per frame), "
+	       "%zu irregular periods, %zu after the second vsync, power-on fill done at sample %zu, picture %s\n",
+	       ok ? "PASS" : "FAIL", vs.size(), vs[0], vs[1], hp, vp, bad, late, s.vfill_end, moved ? "live" : "frozen");
+	return ok;
+}
+
 static const char *arg(int argc, char **argv, const char *name, const char *def) {
 	for (int i = 1; i < argc - 1; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
 	return def;
@@ -1020,8 +1079,15 @@ static void poke_prg(Sim &s, const char *path, bool verbose) {
 // optional PRG/TAP/typing after READY
 static const char *g_kbuf = nullptr;
 static const char *g_ram_prg = nullptr;   // --ram-prg file: poke_prg before --kbuf
+static bool g_reu_fill = false;           // --reu-fill: the 16 MiB REU lane written, every page in the map
 static void load(Sim &s, const char *prg, const char *tap, const char *text, bool verbose) {
 	apply_status(s, g_status_ready);
+	if (g_reu_fill) {
+		// as if the machine had written every REU page since power on (worst-case save)
+		for (uint32_t a = 0; a < 1u << 24; a++) s.poke_ram(0x1000000 + a, (uint8_t)((a * 2654435761u) >> 24));
+		for (int p = 0; p < 4096; p++) EMO(s, ss_reu_pages__DOT__map)[p] = 1;
+		if (verbose) printf("REU lane filled, 4096 pages mapped\n");
+	}
 	if (g_ram_prg) poke_prg(s, g_ram_prg, verbose);
 	if (prg) {
 		// FS1,PRGCRTREUTAP: PRG is extension 0 (index 1), CRT extension 1 (index 0x41)
@@ -1078,6 +1144,16 @@ static void load(Sim &s, const char *prg, const char *tap, const char *text, boo
 	_exit(rc);
 }
 
+// kill -USR1 <pid>: clk_sys and frames of every instance (a slow run or a hung one)
+static void progress(int) {
+	char b[96];
+	for (Sim *s : sim_instances) {
+		int n = snprintf(b, sizeof b, "SIGUSR1: clk_sys %llu, frames %llu\n",
+			(unsigned long long)s->sys_cycles, (unsigned long long)s->frames);
+		if (write(1, b, n) < 0) break;
+	}
+}
+
 // --freeze-at: "C" = C clk_sys cycles from now, "$ADDR" = opcode fetch at ADDR
 static void run_to(Sim &s, const char *at) {
 	if (at[0] == '$') {
@@ -1112,6 +1188,7 @@ static void run_frames(Sim &s, int n) {
 static int run_main(int argc, char **argv) {
 	Verilated::commandArgs(argc, argv);
 	setvbuf(stdout, nullptr, _IOLBF, 0);
+	signal(SIGUSR1, progress);
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--opl")) g_opl = true;
 		if (!strcmp(argv[i], "--clk50")) g_clk50 = true;
@@ -1125,6 +1202,7 @@ static int run_main(int argc, char **argv) {
 	const char *text = arg(argc, argv, "--type", nullptr);
 	g_kbuf = arg(argc, argv, "--kbuf", nullptr);
 	g_ram_prg = arg(argc, argv, "--ram-prg", nullptr);
+	g_reu_fill = has(argc, argv, "--reu-fill");
 	g_disk = arg(argc, argv, "--disk", nullptr);
 	g_status = arg(argc, argv, "--status", nullptr);
 	g_status_ready = arg(argc, argv, "--status-ready", nullptr);
@@ -1171,6 +1249,7 @@ static int run_main(int argc, char **argv) {
 		load(s, prg, tap, text, true);
 		const char *freeze_at = arg(argc, argv, "--freeze-at", nullptr);
 		const char *slot_out = arg(argc, argv, "--slot", nullptr);
+		s.sm.on = slot_in || freeze_at;   // output sync across the load and the save
 		if (slot_in) {
 			s.put_slot(0, read_file(slot_in));
 			u64 c0 = s.sys_cycles;
@@ -1204,10 +1283,15 @@ static int run_main(int argc, char **argv) {
 		const char *shot = arg(argc, argv, "--shot", "screen.ppm");
 		if (s.save_ppm(shot)) printf("screenshot %s\n", shot);
 		s.screen_text(stdout);
+		bool sync_ok = true;
+		if (s.sm.on) {
+			run_frames(s, 3);   // past the video-aligned resume after the last operation
+			sync_ok = s.sync_report();
+		}
 		double dt = now() - t0;
 		printf("total %llu clk_sys cycles in %.1f s: %.0f clk_sys/s, %.0f C64 cycles/s\n",
 			(unsigned long long)s.sys_cycles, dt, s.sys_cycles / dt, s.sys_cycles / 32 / dt);
-		finish(0);
+		finish(sync_ok ? 0 : 1);
 	}
 
 	if (!strcmp(mode, "sstest")) {
@@ -1786,7 +1870,16 @@ static int run_main(int argc, char **argv) {
 		bool joy = !strcmp(arg(argc, argv, "--trigger", "key"), "joy");
 		Sim a("a", g_opl, g_clk50), b("b", g_opl, g_clk50);
 		apply_status(a);
+		// --sync-check (with --no-cache): A's output from power on to READY
+		bool sync_check = has(argc, argv, "--sync-check");
+		a.vrec = sync_check;
 		reach_ready(a, max_frames, true);
+		if (sync_check) {
+			if (!check_sync(a)) finish(1);
+			a.vrec = false;
+			a.vstream.clear();
+			a.vpaused.clear();
+		}
 		std::string bstate = "pausetest_b_" + std::to_string(getpid()) + ".state";   // parallel runs share the directory
 		a.save(bstate.c_str());   // B starts as an exact copy of A
 		b.restore(bstate.c_str());

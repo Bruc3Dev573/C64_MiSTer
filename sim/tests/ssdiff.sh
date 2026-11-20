@@ -171,6 +171,7 @@ TESTS="$TESTS $OUT/ntscsid.extra $OUT/ntsccpu.extra \
 	$OUT/reu-off.reject $OUT/reu-on.reject $OUT/crc.reject $OUT/version.reject $OUT/chain.reject \
 	$OUT/buildhash.extra $OUT/mouse.extra $OUT/paddles.extra $OUT/mousefreeze.extra $OUT/opl2.extra $OUT/oplrewind2.extra"
 TESTS="$TESTS $OUT/slotphase.extra"
+TESTS="$TESTS $OUT/reu16.extra $OUT/reu16full.extra $OUT/reu2m.extra $OUT/crc16.extra"
 TESTS="$TESTS $OUT/rewindrun.extra $OUT/rewindpause.extra $OUT/ntscrewind.extra $OUT/efrun.extra $OUT/reurewind.extra \
 	$OUT/vic856x.extra $OUT/vicearly.extra $OUT/poweron.extra"
 if [ -n "${LORENZ:-}" ]; then
@@ -185,10 +186,19 @@ fi
 for p in $TESTS; do   # JOBS instances at a time (two models each)
 	while [ "$(jobs -rp | wc -l)" -ge "${JOBS:-6}" ]; do wait -n || true; done
 	n="$(basename "${p%.*}")"
-	# with the REU the slot carries 512 KiB more (a save takes ~5.3M clk_sys); a
-	# CRT load resets the machine and erases the RAM first (~7M clk_sys)
-	if [ "$n" = reu ]; then st=14,53; t1=9000000; else st=14; t1=3000000; fi
+	# with the REU the slot carries the REU pages written since power on; a CRT
+	# load resets the machine and erases the RAM first (~7M clk_sys)
+	if [ "$n" = reu ]; then st=14,53; else st=14; fi
+	t1=3000000
 	case "$p" in
+		# REU 16 MiB (on at READY, status 53,54): reu.prg writes a few pages and
+		# the slots hold only those; reu16full: every page written (--reu-fill),
+		# the worst case (16 MiB saved in ~17.8M clk_sys, loaded twice); reu2m:
+		# REU 2 MiB; crc16: a damaged full 16 MiB slot refused after its verify pass
+		*/reu16.extra) run "$n" --status-ready 53,54 --ram-prg "$OUT/reu.prg" --kbuf 'RUN\r' --t0 300000 --t1 3000000 --slot "$OUT/ssdiff_reu16_" & ;;
+		*/reu16full.extra) run "$n" --status-ready 53,54 --reu-fill --ram-prg "$OUT/reu.prg" --kbuf 'RUN\r' --t0 300000 --t1 20000000 --slot "$OUT/ssdiff_reu16full_" & ;;
+		*/reu2m.extra) run "$n" --status-ready 54 --ram-prg "$OUT/reu.prg" --kbuf 'RUN\r' --t0 300000 --t1 3000000 & ;;
+		*/crc16.extra) run "$n" --status-ready 53,54 --reu-fill --ram-prg "$OUT/sid.prg" --kbuf 'RUN\r' --t0 300000 --reject crc & ;;
 		*/ntscsid.extra) STATUS=2,14 run "$n" --ram-prg "$OUT/sid.prg" --kbuf 'RUN\r' --t0 300000 --t1 3000000 --slot "$OUT/ssdiff_ntscsid_" & ;;
 		*/ntsccpu.extra) STATUS=2,14 run "$n" --ram-prg "$OUT/cpu.prg" --kbuf 'RUN\r' --t0 300000 --t1 3000000 & ;;
 		*/c1282x.extra|*/c1284x.extra|*/smart3x.extra|*/smart4x.extra)
@@ -205,17 +215,17 @@ for p in $TESTS; do   # JOBS instances at a time (two models each)
 		*/oplrewind2.extra) STATUS=12 run "$n" --opl --fifo-sync 2 --ram-prg "$OUT/opl.prg" --kbuf 'RUN\r' --t0 1500000 --t1 3000000 --after 5000000 --rewind & ;;
 		# EasyFlash: a pass of ef.crt is 2.65M clk_sys, its sector erase busy from
 		# 6.83M + k * 2.65M for 1M clk_sys (write-back 1.2M); a save carries the
-		# 1 MiB flash (10.83M clk_sys). C0 (7.3M) falls in pass 0, C1 (26.1M, i.e.
-		# 15.3M of running time) in pass 3: both with the busy counter running and
-		# the write-back pending (checked in the slots below)
-		*/ef.crt) STATUS=$st run "$n" --prg "$p" --t0 7300000 --t1 26100000 --slot "$OUT/ssdiff_ef_" & ;;
+		# 1 MiB flash (~1.42M clk_sys, D13). C0 (7.3M) falls in pass 0, C1 (16.7M,
+		# i.e. 15.3M of running time) in pass 3: both with the busy counter running
+		# and the write-back pending (checked in the slots below)
+		*/ef.crt) STATUS=$st run "$n" --prg "$p" --t0 7300000 --t1 16700000 --slot "$OUT/ssdiff_ef_" & ;;
 		# EasyFlash rewind: the state of C0 (inside the erase of pass 0) loaded in
 		# the program phase of pass 1
-		*/efrewind.rewind) STATUS=$st run "$n" --prg "$OUT/ef.crt" --t0 7300000 --t1 21000000 --after 3000000 --rewind & ;;
+		*/efrewind.rewind) STATUS=$st run "$n" --prg "$OUT/ef.crt" --t0 7300000 --t1 11600000 --after 3000000 --rewind & ;;
 		*.crt) STATUS=$st run "$n" --prg "$p" --t0 8000000 --t1 12000000 & ;;
 		# GeoRAM 4 MiB on at READY (status 52): ~300k clk_sys per pass of geo.prg,
-		# a save takes 38.6M clk_sys; B runs 4.4M between the save points
-		*/geo.prg) STATUS=$st run "$n" --status-ready 52 --ram-prg "$p" --kbuf 'RUN\r' --t0 2000000 --t1 45000000 --slot "$OUT/ssdiff_geo_" & ;;
+		# a save takes ~4.6M clk_sys (D13); B runs ~4.4M between the save points
+		*/geo.prg) STATUS=$st run "$n" --status-ready 52 --ram-prg "$p" --kbuf 'RUN\r' --t0 2000000 --t1 11000000 --slot "$OUT/ssdiff_geo_" & ;;
 		# Sound Expander: save and loads inside the music (timer ticks every 3 ms,
 		# 48 steps), the audio compared up to the first load, then the replay checks
 		*/opl.prg) STATUS=12 run "$n" --opl --ram-prg "$p" --kbuf 'RUN\r' --t0 1500000 --t1 3000000 --after 4000000 & ;;
@@ -271,6 +281,18 @@ import sys
 p = [sum(any(d[i:i + 256]) for i in range(0, len(d), 256)) for d in (open(f, 'rb').read() for f in sys.argv[1:])]
 print('geo: GeoRAM pages written at C1 %d, at C0 %d' % tuple(p)); sys.exit(not p[0] > p[1] >= 3)" "$OUT/geo_1.bin" "$OUT/geo_2.bin" ||
 	{ echo "FAIL: geo: GeoRAM pages missing in the slots"; fail=1; }
+# REU (format 2): the slots hold REU_PAGES only, page records in order; reu16
+# a few written pages, reu16full all 4096
+for s in reu16_1 reu16_2 reu16full_1 reu16full_2; do
+	python3 "$SIM/scripts/ss_slot.py" --chain-bits "$BITS" "$OUT/ssdiff_$s.ss" > "$OUT/$s.txt" ||
+		{ echo "FAIL: $s: slot"; cat "$OUT/$s.txt"; fail=1; continue; }
+	n=$(sed -n 's/.*tag 0x15 REU_PAGES *\([0-9]*\) bytes.*/\1/p' "$OUT/$s.txt")
+	case "$s" in reu16full*) want=$((4096 * 4104)) ;; *) want= ;; esac
+	if [ -z "$n" ] || grep -q "REU_RAM" "$OUT/$s.txt" || { [ -n "$want" ] && [ "$n" != "$want" ]; } ||
+		{ [ -z "$want" ] && [ "$n" -ge $((4096 * 4104)) ]; }; then
+		echo "FAIL: $s: REU_PAGES ${n:-missing} bytes"; fail=1
+	else echo "$s: REU_PAGES $((n / 4104)) pages"; fi
+done
 
 # 1541 (full model, DRIVE=1): DolphinDOS parallel-cable LOAD of a 7-block file
 # from a tiny D64 (17/0, interleave 10). The LED lights ~18.7M clk_sys after

@@ -349,3 +349,119 @@ those slots on a file load; the drive track cache uses
 messages 24-26, Pause Mute Audio on the user pause), the harness
 (`ssdiff --ring`, DDR3 model), a board test script;
 `docs/SAVESTATES.md` ("Rewind"). The slot format and the chain are unchanged.
+
+## D13 - REU 16 MiB in the slots: 21 MiB slots lower in DDR3, written REU pages only, block transport (2026-11-14)
+
+(D11 and D12 are taken by the A13 branch. The rewind ring that D13 mentions
+is not part of this branch, see D10; nothing else of D13 depends on it.)
+
+**Data.**
+- With 8 MiB slots at 0x3E000000 (D2) a save with the 16 MiB REU is refused
+  ("REU too large for the slot"). The worst case is REU 16 MiB + GeoRAM
+  4 MiB + the rest: 2,641,076 words (20.15 MiB) including one record word
+  per REU page (GeoRAM excludes a CRT; EasyFlash with its RAM is smaller).
+- The engine moved the SDRAM regions over the machine's byte path, ~5
+  clk_sys per byte: a 512 KiB REU added 130 ms to a save, GeoRAM 4 MiB 1.1 s
+  (A12: save 1.37 s and load 1.84 s with GeoRAM and a 512 KiB REU); a 16 MiB
+  REU would take ~3 s to save and more to load.
+- DDR3 above 0x20000000 already in use: the ascal triple buffer
+  0x20000000-0x217FFFFF (sys_top.v:716-720, ascal.vhd), no MISTER_FB
+  (sys_top.v:1747-1753, no MISTER_ define in C64.qsf), the Main frame buffer
+  0x22000000-0x237BAFFF (Main video.cpp:37-38, 2450, 2724), screenshots
+  0x20000000 + 6 MiB (scaler.h:31-32, scaler.cpp:43-50), the drive images at
+  0x30000000/0x30200000, the A12 ring 0x3C000000-0x3CFFFFFF. Linux ends at
+  0x1FEFFFFF (on the board: `mem=511M memmap=513M$511M`, `/proc/iomem`). Main
+  accepts an SS area in [0x20000000, 0x40000000) (user_io.cpp:781, 985,
+  2989; menu.cpp:2448).
+- Main (user_io.cpp `process_ss`, lines 1997-2120) maps four slots of the
+  token size, clears them (memset), reads a slot file up to that size (a
+  smaller, older file loads) and writes `(STATESIZE + 2) * 4` bytes when
+  they fit; the token is limited to 128 MiB per slot and base + 4 slots
+  below 0x40000000.
+- A13 (c5290fa) moved the SDRAM regions in 8-column bursts while frozen
+  (`ss_sdram_port.sv`, an engine path in sdram.v).
+
+**Decision.**
+- Slots: `SS2AC00000:1500000`, four slots of 21 MiB at 0x2AC00000-
+  0x2FFFFFFF, the self-test scratch slot at 0x29700000-0x2ABFFFFF. Main is
+  unchanged. The drive images keep 0x30000000-0x30FFFFFF (the only window
+  where the arbiter now accepts drive writes), the ring stays at 0x3C000000.
+  After a merge with A13 its area 0x31000000-0x3CFFFFFF stays as it is and
+  its scratch and slots (0x3D800000, 0x3E000000) move to these addresses.
+- Accepted cost: Main clears the whole SS area through /dev/mem (O_SYNC,
+  shmem.cpp:22,30) on every file load and drive-8 mount: 84 MiB instead of
+  32 MiB, estimated +0.3 to +1.1 s at 50-200 MB/s (not measured). The board
+  measurement (A12v against A12r, same PRG) decides.
+- Format version 2. The REU is saved as REU_PAGES (tag 0x15): for every
+  4 KiB page written since power on, one record word `{4096, page index}`
+  and the 512 words of the page, page indexes strictly increasing. All other
+  regions are unchanged (byte-identical to version 1). Version 1 slots
+  (whole REU under REU_RAM, tag 0x09) still load, every page counting as
+  written. A load verifies the records (order, index, length) with the CRC
+  before it writes anything.
+- REU page map (`ss_reu_map.sv`, 4096 bits in one M10K): a bit means "this
+  page may differ from zero". Every write of the machine into the REU lane
+  (SDRAM address bit 24: REU DMA, REU file load) sets it, engine traffic
+  does not; it survives every core reset, as the REU data does. Only FPGA
+  configuration clears all bits, and a load clears the bits of the pages it
+  zeroes: a load writes the pages the slot holds and zeroes every mapped
+  page it does not hold, so the REU is exactly the one saved.
+- Behaviour change: the power-on content of the REU is zero. After FPGA
+  configuration c64.sv zero-fills the 16 MiB lane with the engine transport
+  while the machine is held in reset (its grid and video run, its SDRAM ce
+  masked; ioctl waits) and hands the SDRAM back on a refresh pulse, where the
+  machine's ce is low. The first boot takes ~0.29 s
+  longer (~9.1M clk_sys). Before, the REU held whatever the SDRAM powered up
+  with. `ss_reu_clr` holds the reset counter of c64.sv at its start value
+  through the whole fill (reset_n low); a reset button or an OSD reset
+  during it changes nothing (the counter is already held) or, still pressed
+  at its end, extends the reset as usual; after the fill the machine runs
+  the normal power-on reset (100,000 clk_sys, RAM erase). A core reload is a
+  new FPGA configuration and starts a new fill. A first version paused the
+  machine for the fill: its release, the first resume after power on, moved
+  the output sync by 2 dots once (`pausetest --sync-check`), so the fill now
+  runs under reset only, as A12's reset.
+- Transport, only while the machine is frozen: transfers of 256 bytes on one
+  DQ lane and one row (two AUTO REFRESH, ACTIVE, 256 columns, the last with
+  auto-precharge). WRITEs go one per clk64 (each data word leaves the output
+  register as for a single WRITE), READs one every other clk64, captured
+  three clocks after the READ as in the normal path: 140 clk_sys per write
+  transfer, 267 per read transfer (`tb_ss_transport`); the row stays open
+  8.1 us at most (tRAS max 120 us), two AUTO REFRESH per transfer keep 8192
+  within 64 ms with read transfers back to back. The first build read one
+  column per clk64 (137 clk_sys per transfer): every simulation checker
+  passed, but on the board the saved bytes had single bits of the next column
+  (screen RAM "**** COMMODORE" saved as 28 2a 2a 2a 20 21 0f 0d 0d 0d ...),
+  without a REU and with one, while A12v saved the same state exactly: the
+  next column reached the DQ input register at the capture edge. A13 reads
+  one column every other clk64 and was exact on the board. The command-level
+  checker cannot see pad timing (sim/README.md); a board test checks a known
+  pattern in RAM and in every REU bank byte
+  for byte on the board, through a save and a load. The first transfer after
+  the controller's init waits for one normal AUTO REFRESH (with its own, the
+  two the chip needs before an ACTIVE). The engine streams 64-bit words
+  through a 64-word FIFO, writes and reads DDR3 in bursts of 32 (the drives'
+  DDR3 traffic interleaves burst by burst) and computes the CRC over 8 bytes
+  per clock. A load reads the slot twice: verify, then restore. The byte
+  regions (drives, Color RAM, OPL) keep the byte paths.
+- Cost of the safe READ cadence: a save with a fully written 16 MiB REU
+  takes 17.84M clk_sys, 0.566 s (65,536 read transfers; one REU byte per
+  two clk64 puts the floor at 0.532 s), more than the 0.4 s aimed at; the
+  load takes 12.11M clk_sys, 0.384 s, verify pass included (`ssdiff`
+  `reu16full`).
+- Rewind stays off with any REU (D10).
+
+**Changes.** `rtl/sdram.v` (engine sequencer, gated by `ss_own`; the normal
+path is unchanged while it is low), `ss_sdram_port.sv` (rewritten after A13:
+transfers, power-on fill), `savestates.sv` (streaming engine: FIFO, DDR3
+bursts, CRC 8 bytes per clock, REU_PAGES, verify pass), `ss_ddram_arb.sv`
+(burst arbitration, drive write window), `ss_reu_map.sv` (new),
+`statemanager.sv` (base and slot size), `c64.sv` (token, SDRAM mux, page
+map, power-on fill), `savestate/map.yaml` (version 2, `slot_bytes`,
+`ddr_base`, `reu_page_bytes`, `pages_tag`), the simulation (chip model:
+two READs in flight, tRAS max; `tb_ss_transport`, harness `--reu-fill`,
+`--sync-check`), `sys/ascal.vhd` (a second local timing change for the
+HDMI clock, checked by `tb_ascal_vcpt`; SAVESTATES.md "Resources"),
+a board test (memory saved and restored byte for byte on
+the board), `docs/SAVESTATES.md`. Times measured in the simulation:
+`docs/SAVESTATES.md` ("Memory regions", "Resources").

@@ -557,6 +557,7 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL o_hacpt,o_vacpt : unsigned(11 DOWNTO 0);
 	SIGNAL o_vacptl : unsigned(1 DOWNTO 0);
 	SIGNAL o_vacpt_gt,o_vacpt_eq : boolean; -- C64 core local change: o_vacpt vs o_ivsize, one clock ahead (timing)
+	SIGNAL o_vcpt_pre3_end : boolean; -- C64 core local change: o_vcpt_pre3+1>=o_vtotal, one clock ahead (timing)
 	signal o_newres : integer range 0 to 3;
 
 	-----------------------------------------------------------------------------
@@ -2775,6 +2776,11 @@ BEGIN
 	BEGIN
 		IF rising_edge(o_clk) THEN
 
+			-- C64 core local change: the end-of-frame compare of the line counter
+			-- is registered one clock before its use; o_vcpt_pre3 changes only at
+			-- the end of a line and o_vtotal is a mode setting
+			o_vcpt_pre3_end<=o_vcpt_pre3+1>=o_vtotal;
+
 			IF o_ce='1' THEN
 				-- Output pixels count
 				IF o_hcpt+1<o_htotal THEN
@@ -2786,7 +2792,7 @@ BEGIN
 						o_vcpt_sync <= o_vcpt_sync+1;
 					END IF;
 
-					IF o_vcpt_pre3+1>=o_vtotal THEN
+					IF o_vcpt_pre3_end THEN
 						o_vcpt_pre3<=0;
 					ELSIF o_vrr_sync2 THEN
 						o_vcpt_pre3<=o_vsstart;

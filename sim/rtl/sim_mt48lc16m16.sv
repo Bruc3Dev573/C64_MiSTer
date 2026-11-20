@@ -1,10 +1,12 @@
 // MT48LC16M16A2 command-level model; no controller timing is inferred from ce.
 // Micron 256Mb_sdr.pdf Rev. W, AC tables (-6A/-7E/-75), initialization and
 // auto-precharge sections: https://www.alliancememory.com/wp-content/uploads/Micron_256M_SDRAM_PartNo.MT48LC16M16A2.pdf
-// Use the conservative -75 envelope: tRCD/tRP=20ns, tRAS=44ns,
+// Use the conservative -75 envelope: tRCD/tRP=20ns, tRAS=44ns..120us,
 // tRC/tRFC=66ns, manual tWR=15ns, auto tWR=1 clock+7.5ns, tMRD=2 clocks.
 // -6A: 18/18/42/60/60/12ns, auto tWR=1 clock+6ns;
 // -7E: 15/15/37/60/66/14ns, auto tWR=1 clock+7ns.
+// BL=1 READs may follow each other on every clock (tCCD 1): each drives its
+// data CAS 2 clocks later, at most two are in flight.
 module sim_mt48lc16m16 (
 	input             clk,
 	input             cke,
@@ -27,8 +29,9 @@ localparam integer TRC  = integer'($ceil(66.0 / TCK_NS));
 localparam integer TRFC = integer'($ceil(66.0 / TCK_NS));
 localparam integer TWR  = integer'($ceil(15.0 / TCK_NS));
 localparam integer TWRA = 1 + integer'($ceil(7.5 / TCK_NS));
+localparam integer TRASMAX = integer'($floor(120000.0 / TCK_NS));
 localparam integer TREF = integer'($floor(64000000.0 / TCK_NS));
-localparam integer NERR = 12;
+localparam integer NERR = 13;
 localparam [2:0] LMR=0, REF=1, PRE=2, ACT=3, WR=4, RD=5, BST=6, NOP=7;
 wire [2:0] cmd = cs_n ? NOP : {ras_n, cas_n, we_n};
 
@@ -51,9 +54,12 @@ reg [63:0] refresh_history [8192];
 reg [12:0] refresh_row = 0;
 reg [13:0] refresh_count = 0;
 reg refresh_late = 0;
-reg [63:0] read_at = 0;
-reg [23:0] read_addr = 0;
-reg read_pending = 0, read_owner = 0;
+reg [1:0] rp_v = 0;                 // READ data pending: [0] older, [1] newer
+reg [63:0] rp_at [2];
+reg [23:0] rp_addr [2];
+reg rp_owner [2];
+reg out_now;
+reg [3:0] ras_late = 0;            // tRAS max reported for the open row
 reg [1:0] dqm_d1 = 3, dqm_d2 = 3, dq_mask = 3;
 reg [15:0] dq_out = 0;
 reg dq_valid = 0;
@@ -74,7 +80,8 @@ function automatic string error_name(input integer n);
 		3: error_name="tRAS"; 4: error_name="tRC"; 5: error_name="tRFC";
 		6: error_name="tWR"; 7: error_name="refresh_64ms";
 		8: error_name="initialization"; 9: error_name="mode";
-		10: error_name="tMRD"; default: error_name="DQ_overlap";
+		10: error_name="tMRD"; 11: error_name="DQ_overlap";
+		default: error_name="tRAS_max";
 	endcase
 endfunction
 task automatic violation(input integer kind, input integer bank, input string detail);
@@ -95,11 +102,12 @@ task automatic precharge_bank(input integer bank);
 		end
 		opened[bank] = 0;
 		auto_pending[bank] = 0;
+		ras_late[bank] = 0;
 		available_at[bank] = cycle + TRP;
 	end
 endtask
 
-integer b, lane;
+integer b, lane, slot;
 reg [24:0] byte_addr;
 reg [63:0] gap, deadline, earliest;
 always @(posedge clk) begin
@@ -114,20 +122,30 @@ always @(posedge clk) begin
 			opened[b] = 0;
 			auto_pending[b] = 0;
 		end
+		if(opened[b] && !auto_pending[b] && cycle-active_at[b] > TRASMAX && !ras_late[b]) begin
+			violation(12, b, "row open longer than tRAS max");
+			ras_late[b] = 1;
+		end
 	end
-	if(read_pending && cycle == read_at) begin
-		dq_out <= {mem[{1'b1, read_addr}], mem[{1'b0, read_addr}]};
+	out_now = 0;
+	if(rp_v[0] && cycle == rp_at[0]) begin
+		dq_out <= {mem[{1'b1, rp_addr[0]}], mem[{1'b0, rp_addr[0]}]};
 		dq_valid <= 1;
-		read_pending = 0;
+		out_now = 1;
 		for(lane=0; lane<2; lane=lane+1) begin
-			byte_addr = {lane[0], read_addr};
+			byte_addr = {lane[0], rp_addr[0]};
 			if(!dqm_d2[lane] && !written[byte_addr[24:3]][byte_addr[2:0]]) begin
-				unwritten[read_owner] = unwritten[read_owner] + 1;
-				if(unwritten[read_owner] <= 2)
+				unwritten[rp_owner[0]] = unwritten[rp_owner[0]] + 1;
+				if(unwritten[rp_owner[0]] <= 2)
 					$display("SDRAM info %m clk64=%0d owner=%s unwritten_byte=%h (zero, not a violation)",
-						cycle, read_owner ? "engine" : "normal", byte_addr);
+						cycle, rp_owner[0] ? "engine" : "normal", byte_addr);
 			end
 		end
+		rp_v[0] = rp_v[1];
+		rp_at[0] = rp_at[1];
+		rp_addr[0] = rp_addr[1];
+		rp_owner[0] = rp_owner[1];
+		rp_v[1] = 0;
 	end
 	if(!initialized && precharged && mode_loaded && init_refreshes == 2 &&
 		cycle-mode_at >= 2 && cycle-refresh_at >= TRFC) begin
@@ -190,6 +208,7 @@ always @(posedge clk) begin
 				activated[ba] = 1;
 				wrote[ba] = 0;
 				auto_pending[ba] = 0;
+				ras_late[ba] = 0;
 				row[ba] = addr;
 				active_at[ba] = cycle;
 			end
@@ -198,7 +217,7 @@ always @(posedge clk) begin
 				if(cycle-active_at[ba] < TRCD) violation(1, ba, "column command too soon after ACTIVE");
 				byte_addr = {1'b0, addr[8], ba, row[ba], addr[7:0]};
 				if(cmd == WR) begin
-					if(dq_valid || (read_pending && read_at <= cycle+2)) violation(11, ba, "WRITE overlaps read data");
+					if(dq_valid || out_now || rp_v != 0) violation(11, ba, "WRITE overlaps read data");
 					for(lane=0; lane<2; lane=lane+1) if(!dqm[lane]) begin
 						byte_addr[24] = lane[0];
 						mem[byte_addr] = dq[8*lane +: 8];
@@ -208,11 +227,14 @@ always @(posedge clk) begin
 					write_at[ba] = cycle;
 				end
 				else begin
-					if(read_pending) violation(11, ba, "overlapping READs unsupported by single-access controller");
-					read_pending = 1;
-					read_at = cycle+2;
-					read_addr = byte_addr[23:0];
-					read_owner = ss_own;
+					if(rp_v[1]) violation(11, ba, "more than two READs in flight");
+					else begin
+						slot = rp_v[0] ? 1 : 0;
+						rp_at[slot] = cycle+2;
+						rp_addr[slot] = byte_addr[23:0];
+						rp_owner[slot] = ss_own;
+						rp_v[slot] = 1;
+					end
 				end
 				if(addr[10]) begin
 					earliest = cycle + (cmd == WR ? TWRA : 1);

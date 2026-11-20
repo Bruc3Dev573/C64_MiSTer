@@ -26,7 +26,9 @@ The existing freeze path is reused. `freeze` (clk_sys) now follows
 `freeze_sync`, i.e. on a frame boundary of the scaler, so HDMI holds a whole
 frame. `fpga64_sid_iec` stops the machine on the refresh cycle (`sysEnable`
 low, `sysCycle` held at `CYCLE_EXT4`); `pause_out` (`c64_pause`) is already
-used by the 1541/1581 drives and by `video_sync`.
+used by the 1541/1581 drives and by `video_sync`. A save or a load stops
+the machine for 2-3 frames, and up to ~0.6 s for a save of a full 16 MiB
+REU (D13).
 
 With Dim enabled the sequence is: pause requested -> next frame is drawn
 dimmed -> freeze. The C64 runs one more frame before stopping.

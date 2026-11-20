@@ -144,7 +144,9 @@ without READY and loads the slot from clk_sys C on, retrying once a frame
 while the engine refuses it (reset, RAM erase).
 
 Output sync monitor (`sync_mon`/`stop_mon` in `c64_tb.cpp`), armed in every
-`ssdiff` (A and B), `sstest`, `pausetest` and `boot --load-at`: on clk64 it
+`ssdiff` (A and B), `sstest`, `pausetest`, `boot --load-at` and `boot` with
+`--load-slot` or `--freeze-at` (from READY/PRG on; the D13 format 1 slot
+loads, field snapshots; exit 1 on FAIL): on clk64 it
 follows the core's `hsync_out`/`vsync_out` and the freezer outputs of the
 video mixer, i.e. what the scaler and `video_calc` of `sys/hps_io.sv` get
 (the core's sync, or the one `video_freezer` regenerates while
@@ -277,12 +279,13 @@ CLK_50M with `--clk50` or NTSC at power on. clk48 is exactly 3/2 clk_sys (half p
 femtoseconds), as on the board where both divide the VCO of the core PLL: a
 pause of whole C64 cycles keeps the phase of clk48. DDRAM is a C++ model in
 the harness (sparse 64-bit words, random waitrequest, read bursts after a
-latency). Drive track cache traffic (addresses below the self-test scratch
-slot, word 0x07B00000) draws its waitrequest and latency from its own
-random sequence that steps only on clocks where the drives run, and its read
-beats arrive only then: a paused or saving instance sees the drive DMA
-exactly as one that never stopped. The two instances of `pausetest`/`ssdiff`
-share the host state at the fork.
+latency, write bursts). Drive track cache traffic (the drive window, bytes
+0x30000000-0x30FFFFFF) draws its waitrequest and latency from its own random
+sequence that steps only on clocks where the drives run, and its read beats
+arrive only then: a paused or saving instance sees the drive DMA exactly as
+one that never stopped. The two instances of `pausetest`/`ssdiff` share the
+host state at the fork. Slots are at word 0x05580000 + n * 0x2A0000 (DDR3
+0x2AC00000, 21 MiB each, D13).
 
 ### Real SDRAM controller and chip checking
 
@@ -307,7 +310,10 @@ the WRITE command. Its public byte array retains the controller's unusual
 address mapping: bit 24 selects the DQ lane, bit 23 column bit 8, bits
 22:21 the bank, bits 20:8 the row and bits 7:0 the column low bits.
 Harness RAM pokes mark the corresponding bytes initialized; ioctl CRT,
-REU and TAP transfers still pass through the controller.
+REU and TAP transfers still pass through the controller. The savestate
+transfers of D13 (256 consecutive BL=1 columns of one row) need two READs
+in flight (one per clock, data two clocks later) and a row open for 4.1 us:
+the model keeps up to two READs pending and checks tRAS max (120 us).
 
 Timing comes from [Micron 256Mb SDRAM, Rev. W (05/15), tables 12–13 and
 the initialization/auto-precharge sections](https://www.alliancememory.com/wp-content/uploads/Micron_256M_SDRAM_PartNo.MT48LC16M16A2.pdf).
@@ -325,8 +331,8 @@ up to clocks; the 64 ms refresh deadline rounds down.
 | tWR, auto-precharge | 1 clk + 6 ns | 1 clk + 7 ns | 1 clk + 7.5 ns | 2 |
 | tMRD | 2 clk | 2 clk | 2 clk | 2 |
 
-The checker counts bank-state errors, the timings above, unsupported mode
-settings and commands before PRECHARGE ALL, mode programming and two initial
+The checker counts bank-state errors, the timings above, tRAS max, unsupported
+mode settings and commands before PRECHARGE ALL, mode programming and two initial
 AUTO_REFRESH commands have completed. Refresh retention uses a rolling
 8192-refresh/64 ms window: legal burst refresh is not rejected just because
 a gap exceeds the uniform 7.8125 us average. Every chip clock contributes
@@ -346,8 +352,9 @@ read masking, CAS latency and auto-precharge in a small chip bench. It
 deliberately violates tRCD and suppresses refresh, asserting the respective
 engine-owned counters. It then builds a throwaway real controller with
 `RASCAS_DELAY=1` through `RTL_OVERLAY` under `sim/build/sdram-check` and
-requires a nonzero tRCD count from a bounded cold boot; failure to reach
-READY alone is not accepted as proof. Synthesized sources are untouched.
+requires a nonzero tRCD count from a bounded cold boot of 18 frames (the
+power-on REU fill of D13, engine-owned, takes the first ~14.5); failure to
+reach READY alone is not accepted as proof. Synthesized sources are untouched.
 
 Negative-control result (2026-11-06): chip data-path checks PASS; one
 engine-owned tRCD violation and one engine-owned refresh-deadline violation,
@@ -355,6 +362,11 @@ both asserted by the bench. The RASCAS_DELAY=1 overlay produced 143,603
 normal-running tRCD violations and zero engine-owned violations (no save
 in that cold boot). The first was READ at clk64 1,258,009 / 19,950,694.54 ns,
 bank 0, row 0x00ff, pin address 0x0400. The overlay is not production RTL.
+
+Negative-control result (2026-11-15, D13 final RTL): chip checks PASS; the
+overlay produced 328,119 normal tRCD violations; the engine-owned power-on
+fill (9,118,336 clk_sys) had none (133,923 refreshes, longest gap 456
+clk64 / 7231.68 ns).
 
 Real-controller acceptance (2026-11-07, `DRIVES=0`, `JOBS=6`):
 
@@ -387,9 +399,13 @@ Full-drive and NTSC real-controller scenarios were not run.
 | pausetest (two instances in one thread) | | ~84k clk_sys/s per instance |
 
 One second of C64 time costs ~6 min with drives, ~3.3 min without. The
-READY snapshot removes the boot from every later run. About
+READY snapshot removes the boot from every later run; a cold boot now
+starts with the power-on REU fill (D13, ~9.1M clk_sys, ~1 min DRIVES=0). About
 40% of the full model's time is spent in the four drive instances even when
-nothing is mounted (gprof, `PROFILE=1 sim/build.sh`).
+nothing is mounted (gprof, `PROFILE=1 sim/build.sh`). `kill -USR1` on a
+running harness prints clk_sys and frames of each instance (a slow run or a
+hung one). On a loaded host the speed drops a lot: 2026-11-14, with the
+other acceptance runs on the same 14 CPUs, ~21k clk_sys/s DRIVES=0.
 
 ## Known limitations
 
@@ -399,6 +415,18 @@ nothing is mounted (gprof, `PROFILE=1 sim/build.sh`).
 - Mouse packets are not queued during an engine freeze; the single-packet
   save/load cases are covered, but multiple packets can coalesce as described
   above. Physical paddle/USB transport timing is outside the host model.
+- `pausetest --load-slot` with the pause soon after the load (`--t0
+  300000`): the running samples of A and B are compared exactly (PASS), but
+  the pause checks around them are not clean. A load to another VIC
+  position resumes up to a frame after the release (`video_sync`), so the
+  pause request at t0 can come while B still waits for that resume and the
+  counted pause takes in the tail of the load's stop: "FAIL: paused time is
+  not a whole number of C64 cycles" (A12 model, and D13 after the merge of
+  the load sync fix, 2026-11-16; D13 before it: "FAIL video: 504/169344
+  dots per line/frame"). A t0 past the resume (more than a frame) avoids
+  it. `pausetest --sync-check --t0 300000` can likewise take the pause in
+  the first recorded frame ("FAIL video: pause not found in the
+  recording", the video check needs a frame before the pause).
 - The default SDRAM model does not check chip timing; use `SDRAM=real`.
   The command-level model covers this controller's BL=1, CAS=2 operation,
   not arbitrary bursts, power-down or self-refresh (unsupported commands
@@ -407,6 +435,11 @@ nothing is mounted (gprof, `PROFILE=1 sim/build.sh`).
   Power rails and the initial 100 us power-up delay are assumed settled
   before the simulated interval; board power-up/PLL-lock sequencing is not
   verified. PRECHARGE ALL, mode programming and two initial refreshes are checked.
+  Pad and board timing are invisible to it: the first D13 transport read one
+  column per clk64 with 0 violations in every scenario and still saved
+  corrupted bytes on the board (bits of the next column at the capture edge
+  of the DQ input register, 2026-11-14); only the board shows where the
+  capture window of `sdram.v` ends (a board test of a known memory pattern).
 - Drives read disks from the DDR3 model or, for the 1581, from the SD
   block interface: `--disk file.d64|.g64|.d81` puts the image on drive 8 at
   power on as Main 20261010 does (D64 synthesized to G64 at DDR3 0x30000000,
